@@ -13,7 +13,7 @@ Bot Go dengan dashboard lokal untuk memantau candle swap USDT OKX dan menjalanka
 
 ## Konfigurasi API
 
-Aplikasi membaca environment variables saat startup. File `.env` **tidak dibaca otomatis**; muat variabelnya ke shell sebelum menjalankan aplikasi.
+Aplikasi membaca file `.env` dari direktori kerja saat startup. Environment variables yang sudah ditetapkan oleh proses akan tetap diprioritaskan.
 
 Jika file `.env` belum ada, buat dari contoh:
 
@@ -23,12 +23,9 @@ cp .env.example .env
 
 Jika `.env` sudah ada, jangan menimpanya. Tambahkan atau ubah variabel yang diperlukan di file tersebut. Jangan masukkan secret ke `main.go`, README, atau commit Git.
 
-Muat variabel dan jalankan bot dari direktori proyek:
+Jalankan bot dari direktori proyek:
 
 ```sh
-set -a
-. ./.env
-set +a
 go run .
 ```
 
@@ -39,7 +36,7 @@ go build -o okx-bot .
 ./okx-bot
 ```
 
-Perubahan pada `.env` hanya berlaku setelah proses bot dihentikan dan dimulai ulang.
+Perubahan pada `.env` hanya berlaku setelah proses bot dihentikan dan dimulai ulang. Pastikan menjalankan bot dari direktori proyek agar file `.env` ditemukan.
 
 ## Mode Demo
 
@@ -67,7 +64,7 @@ OKX_SECRET_KEY=isi_secret_key_live
 OKX_PASSPHRASE=isi_passphrase_live
 ```
 
-Mode live menggunakan API REST dan WebSocket production, serta tidak mengirim header simulasi. Hentikan bot, muat ulang `.env`, lalu jalankan lagi. Startup akan mencetak peringatan `LIVE TRADING MODE` dan dashboard menampilkan `OKX Live Trading • Real Orders`.
+Mode live menggunakan API REST dan WebSocket production, serta tidak mengirim header simulasi. Hentikan bot lalu jalankan lagi. Startup akan mencetak peringatan `LIVE TRADING MODE` dan dashboard menampilkan `OKX Live Trading • Real Orders`.
 
 ## Kembali ke Demo
 

@@ -19,6 +19,7 @@ import (
 
 	"github.com/cinar/indicator"
 	"github.com/gorilla/websocket"
+	"github.com/joho/godotenv"
 )
 
 // ==========================================
@@ -57,6 +58,10 @@ type AppState struct {
 }
 
 func loadConfigFromEnv() Config {
+	if err := godotenv.Load(); err != nil && !os.IsNotExist(err) {
+		log.Printf("could not load .env: %v", err)
+	}
+
 	mode := strings.ToLower(strings.TrimSpace(os.Getenv("OKX_MODE")))
 	if mode == "" {
 		mode = "demo"
