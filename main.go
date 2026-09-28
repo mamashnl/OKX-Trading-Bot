@@ -605,10 +605,10 @@ func main() {
 
 	fmt.Println("========================================")
 	fmt.Printf("  OKX SCALPER PRO (%s MODE)\n", strings.ToUpper(state.Config.Mode))
-	fmt.Println("  UI Ready at: http://103.186.30.230:80")
+	fmt.Println("  UI Ready at: http://103.186.30.230:8081")
 	fmt.Println("========================================")
 
-	log.Fatal(http.ListenAndServe("0.0.0.0:80", nil))
+	log.Fatal(http.ListenAndServe("0.0.0.0:8081", nil))
 }
 
 // ==========================================
