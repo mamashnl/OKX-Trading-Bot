@@ -396,7 +396,8 @@ func checkTradingSignal(symbol string, currentPrice float64) {
 		}
 	}
 
-	if position == "LONG" {
+	switch position {
+	case "LONG":
 		// TP: 0.3% | SL: 0.5%
 		if entryPrice > 0 && ((currentPrice-entryPrice)/entryPrice >= 0.003 || (entryPrice-currentPrice)/entryPrice >= 0.005) {
 			err := closePosition(symbol, "sell", contracts) // PERBAIKAN: Gunakan cs.Contracts
@@ -409,7 +410,7 @@ func checkTradingSignal(symbol string, currentPrice float64) {
 				addLog(fmt.Sprintf("[ERROR] Gagal close LONG %s: %v", symbol, err))
 			}
 		}
-	} else if position == "SHORT" {
+	case "SHORT":
 		if entryPrice > 0 && ((entryPrice-currentPrice)/entryPrice >= 0.003 || (currentPrice-entryPrice)/entryPrice >= 0.005) {
 			err := closePosition(symbol, "buy", contracts) // PERBAIKAN: Gunakan cs.Contracts
 			if err == nil {
@@ -605,10 +606,10 @@ func main() {
 
 	fmt.Println("========================================")
 	fmt.Printf("  OKX SCALPER PRO (%s MODE)\n", strings.ToUpper(state.Config.Mode))
-	fmt.Println("  UI Ready at: http://103.186.30.230:8081")
+	fmt.Println("  UI Ready at: http://103.186.30.230:8080")
 	fmt.Println("========================================")
 
-	log.Fatal(http.ListenAndServe("0.0.0.0:8081", nil))
+	log.Fatal(http.ListenAndServe("0.0.0.0:8080", nil))
 }
 
 // ==========================================
