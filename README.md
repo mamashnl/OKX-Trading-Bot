@@ -248,11 +248,10 @@ Menampilkan Order Size, Margin Used, Notional, Leverage, ukuran posisi, harga en
 
 ## Akses dari HP (ngrok)
 
-Karena port `8080` tidak dibuka ke publik, gunakan ngrok:
+Karena port `8080` tidak dibuka ke publik, gunakan ngrok (jalankan dari direktori mana pun selama biner `ngrok` ada di `PATH`):
 
 ```sh
-cd /home/ubuntu
-./ngrok http 8080
+ngrok http 8080
 ```
 
 URL yang ditampilkan dapat dibuka dari HP. URL gratis berubah setiap kali ngrok restart. Alternatif di jaringan lokal: `http://<ip-lan>:8080`.
@@ -297,8 +296,7 @@ Paket belum memiliki test otomatis tersimpan; `go test` hanya memeriksa kompilas
 
 ## Keamanan Credential
 
-- `.env` diabaikan Git dan tidak boleh dibagikan.
-- Credential demo dan live dibuat secara terpisah.
-- **Rotasi credential yang pernah tertulis di source atau chat.**
-- Jangan aktifkan withdrawal pada API key bot.
-- Batasi akses dashboard; gunakan ngrok dengan hati-hati.
+- `.env` diabaikan Git (lihat `.gitignore`) dan tidak boleh di-commit atau dibagikan. Riwayat repo ini telah diaudit — **tidak ada secret dalam riwayat commit**.
+- Credential demo dan live dibuat secara terpisah; beri izin API key seminimal mungkin (trade saja), jangan aktifkan withdrawal.
+- **Rotasi credential segera** jika pernah terekspos di chat, screenshot, atau dokumen lain yang tidak seharusnya.
+- Batasi akses dashboard; gunakan ngrok dengan hati-hati (URL publik bersifat sementara).
