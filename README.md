@@ -1,6 +1,6 @@
 # OKX Scalper Bot
 
-Bot Go dengan dashboard web responsif untuk memantau candle swap USDT OKX dan menjalankan strategi Bollinger Bands + RSI. Defaultnya **demo trading**. Mode live tersedia, tetapi mengirim order sungguhan dan berisiko kehilangan dana.
+Bot dengan dashboard web responsif untuk memantau candle swap USDT OKX dan menjalankan strategi Bollinger Bands + RSI. Defaultnya **demo trading**. Mode live tersedia, tetapi mengirim order sungguhan dan berisiko kehilangan dana.
 
 > **Peringatan:** Jangan beralih ke live sebelum menguji demo dan memverifikasi ukuran kontrak, parameter order, leverage, serta status posisi di akun OKX. Ini bukan sistem trading siap produksi.
 
@@ -343,22 +343,3 @@ go vet ./...
 go build -o okx-bot .
 go build -race -o okx-bot-race .   # verifikasi tidak ada data race
 ```
-
-Paket belum memiliki test otomatis tersimpan; `go test` hanya memeriksa kompilasi. Verifikasi yang sudah dilakukan:
-
-- **Sizing**: 11 koin × 6 kombinasi margin/leverage, semua `size` valid kelipatan `lotSz`.
-- **Entry live OKX demo**: order + TP + SL, ketiganya `sz` identik dengan ukuran posisi.
-- **Arah TP/SL short**: TP di bawah harga masuk, SL di atas.
-- **`ensureTPSL` idempoten**: pemanggilan kedua tidak membuat order duplikat.
-- **Full close**: `close-position` menghasilkan posisi flat.
-- **Race detector**: 0 `DATA RACE` selama >90 detik operasi live.
-- **ATR (unit test sementara, sudah dihapus)**: nilai ATR dari OHLC sintetis, jarak SL = ATR×mult, TP = 2× SL, invariant pembulatan (risiko ≤ diminta, hadiah ≥ diminta, R:R ≥ 2), fallback persen tanpa data, clamp min 0.25% & cap anti-likuidasi.
-- **Mode ATR live OKX demo**: level SL = ATR×1.0, TP = 2× jarak SL (R:R 1:2.00), tepat 1 TP + 1 SL per posisi 100% `reduceOnly`, dan watchdog tidak mengubah level di sinkronisasi berikutnya (anti-churn).
-- **F1–F4 live OKX demo**: reject 400 untuk F1 % > 100 / nominal > saldo, F2 nilai ≤ 0, F3 jam custom > 23, F4 distance < 0.17%; F3 sesi London memblokir entry baru (~05:00 UTC, 75 detik tanpa `[EXECUTED]`) namun posisi terbuka tetap dikelola (trailing tetap berjalan); F4 trailing memindah SL ke entry saat profit ≥ trigger lalu mengikuti harga ekstrem (5 koin, `[TRAILING]` di log, SL monotonik naik, 0 churn watchdog); saldo akun & PnL harian muncul di dashboard (diambil dari `/api/v5/account/balance` dan `trade/fills` sejak 00:00 UTC).
-
-## Keamanan Credential
-
-- `.env` diabaikan Git (lihat `.gitignore`) dan tidak boleh di-commit atau dibagikan. Riwayat repo ini telah diaudit — **tidak ada secret dalam riwayat commit**.
-- Credential demo dan live dibuat secara terpisah; beri izin API key seminimal mungkin (trade saja), jangan aktifkan withdrawal.
-- **Rotasi credential segera** jika pernah terekspos di chat, screenshot, atau dokumen lain yang tidak seharusnya.
-- Batasi akses dashboard; gunakan ngrok dengan hati-hati (URL publik bersifat sementara).
