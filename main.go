@@ -3612,7 +3612,7 @@ const uiTemplate = `
                         <div class="tile">
                             <div class="flex items-center justify-between gap-3">
                                 <div>
-                                    <p class="eyebrow mb-0.5">F1 &middot; Position Sizing</p>
+                                    <p class="eyebrow mb-0.5">Position Sizing</p>
                                     <p class="text-[11px] t-subtle leading-snug">Margin per trade = % saldo atau nominal tetap.</p>
                                 </div>
                                 <label class="switch">
@@ -3654,7 +3654,7 @@ const uiTemplate = `
                         <div class="tile">
                             <div class="flex items-center justify-between gap-3">
                                 <div>
-                                    <p class="eyebrow mb-0.5">F2 &middot; Daily Loss Limit</p>
+                                    <p class="eyebrow mb-0.5">Daily Loss Limit</p>
                                     <p class="text-[11px] t-subtle leading-snug">Shutdown otomatis + tutup semua posisi setiap 00:00 UTC.</p>
                                 </div>
                                 <label class="switch">
@@ -3691,7 +3691,7 @@ const uiTemplate = `
                         <div class="tile">
                             <div class="flex items-center justify-between gap-3">
                                 <div>
-                                    <p class="eyebrow mb-0.5">F3 &middot; Time Filter (Sesi)</p>
+                                    <p class="eyebrow mb-0.5">Time Filter (Sesi)</p>
                                     <p class="text-[11px] t-subtle leading-snug">Entry baru hanya di dalam jendela sesi (UTC).</p>
                                 </div>
                                 <span class="chip" :class="timeFilterActiveNow() ? 'chip-idle' : 'chip-lock'" x-text="timeFilterActiveNow() ? 'SESI AKTIF' : 'DI LUAR SESI'"></span>
@@ -3725,7 +3725,7 @@ const uiTemplate = `
                         <div class="tile">
                             <div class="flex items-center justify-between gap-3">
                                 <div>
-                                    <p class="eyebrow mb-0.5">F4 &middot; Trailing Stop</p>
+                                    <p class="eyebrow mb-0.5">Trailing Stop</p>
                                     <p class="text-[11px] t-subtle leading-snug">Kunci profit: SL pindah ke entry lalu mengikuti harga.</p>
                                 </div>
                                 <label class="switch">
