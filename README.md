@@ -9,6 +9,7 @@ Bot Go dengan dashboard web responsif untuk memantau candle swap USDT OKX dan me
 - [Fitur Utama](#fitur-utama)
 - [Perhitungan Margin & Ukuran Order](#perhitungan-margin--ukuran-order)
 - [TP/SL Entire Position](#tpsl-entire-position)
+- [Fitur Manajemen Risiko (F1–F4)](#fitur-manajemen-risiko-f1f4)
 - [Strategi](#strategi)
 - [Persyaratan](#persyaratan)
 - [Konfigurasi API](#konfigurasi-api)
@@ -33,6 +34,10 @@ Bot Go dengan dashboard web responsif untuk memantau candle swap USDT OKX dan me
 | **ATR dinamis** | Level SL/TP menyesuaikan volatilitas pasar 5m terkini: menyempit saat pasar sepi, melebar saat volatil. Dibatasi minimum 0.25% dan maksimum anti-likuidasi (60% dari jarak likuidasi isolated ≈ 100%/leverage). |
 | **Fallback persen** | Saat riwayat ATR belum cukup (bot baru start sebelum seed REST selesai), otomatis memakai persen konfigurasi — bot tidak pernah berhenti memasang TP/SL. |
 | **Watchdog TP/SL** | Setiap 10 detik bot memastikan *setiap* posisi di OKX punya TP+SL 100% **sesuai konfigurasi** — harga/ukuran yang menyimpang otomatis diganti (bukan hanya dipasang jika belum ada). Di mode ATR harga di-anchor ke pemasangan terakhir agar tidak reprice ulang tiap candle. |
+| **F1 Position Sizing** | Margin per trade bisa dihitung dari **% saldo** atau **nominal tetap (USDT)** dengan toggle On/Off. Saat OFF, memakai margin tetap dari konfigurasi. |
+| **F2 Daily Loss Limit** | Batas kerugian harian (realized + unrealized, sejak 00:00 UTC) memicu **shutdown otomatis + tutup semua posisi**. Reset tiap 00:00 UTC. |
+| **F3 Time Filter** | Entry baru hanya di dalam jendela sesi pasar (UTC): Asian, London, New York, NY–London Overlap, atau custom. Posisi terbuka tetap dikelola di luar sesi. |
+| **F4 Trailing Stop** | Setelah profit mencapai trigger, SL dipindah ke harga entry (break-even), lalu mengikuti harga ekstrem dengan jarak trailing — SL hanya bergerak menguntungkan, tidak pernah mundur. |
 | **Sinkronisasi OKX** | Posisi, ukuran kontrak, dan PnL diambil dari OKX tiap 10 detik. |
 | **PnL riil** | Dihitung dari riwayat fill OKX (`/api/v5/trade/fills`) termasuk fee. |
 | **Peringkat konfigurasi** | Instrumen yang delisted dari OKX ditolak backend dengan HTTP 400. |
@@ -156,6 +161,49 @@ Tiap 10 detik `syncPositionsWithOKX()` memanggil `ensureTPSL()` untuk setiap pos
 
 Konsekuensi: **tidak ada posisi terbuka yang bisa teledor tanpa TP/SL yang sesuai konfigurasi**, termasuk posisi yang bukan dibuka oleh bot ini. `KILL SWITCH` membatalkan seluruh algo order pending sebelum berhenti.
 
+## Fitur Manajemen Risiko (F1–F4)
+
+Empat fitur tambahan untuk position sizing, proteksi harian, filter sesi, dan trailing stop — semuanya bisa diaktifkan/dinonaktifkan dari **Trade Configuration**.
+
+### F1 — Position Sizing
+
+- Toggle **On/Off** di panel konfigurasi.
+- **On, mode `% Saldo`**: margin per trade = `Saldo × persen / 100`. Input harus ≤ 100%.
+- **On, mode `Nominal`**: margin per trade = nilai USDT yang diinput. Tidak boleh melebihi saldo akun (ditolak dengan pesan error).
+- **Off**: memakai `Margin per Trade (USDT)` biasa.
+- Bila saldo belum diketahui saat startup (API balance belum tiba), mode `%` memakai fallback margin default agar order tidak gagal di awal.
+- Koin yang margin-nya di bawah minimum 1 lot OKX otomatis *standby* (tidak di-order; dashboard menampilkan margin minimum yang dibutuhkan).
+
+### F2 — Daily Loss Limit
+
+- Toggle **On/Off**; mode **`%`** (default 5%) atau **Nominal USDT**.
+- Loss harian = **realized** (jumlah `pnl` fill OKX sejak 00:00 UTC, termasuk fee) + **unrealized** (jumlah `upl` posisi terbuka saat ini).
+- Basis mode `%` mengikuti **F1 secara dinamis**:
+  - F1 **ON** → batas = hasil hitung Position Sizing × `% / 100`.
+  - F1 **OFF** → batas = saldo akun saat ini × `% / 100`.
+  - Mengubah status/mode F1 saat bot berjalan langsung mengubah basis di evaluasi berikutnya.
+- Bila `Loss harian ≤ −batas` → **shutdown otomatis**: tutup semua posisi, batalkan order TP/SL pending, hentikan engine, dan **kunci start sampai 00:00 UTC** (naikkan/nonaktifkan batas untuk restart lebih awal).
+- Counter di-reset otomatis setiap **00:00 UTC**. Semua perhitungan waktu memakai UTC; konversi ke WIB hanya untuk tampilan.
+
+### F3 — Time Filter
+
+- Dropdown sesi: `24/7` (default), `Asian (00:00–08:00 UTC)`, `London (08:00–16:00 UTC)`, `New York (13:00–21:00 UTC)`, `NY–London Overlap (13:00–16:00 UTC)`, atau `Custom` (input jam mulai/selesai, 0–23 UTC).
+- Bot **hanya membuka posisi baru** di dalam jendela sesi (UTC).
+- Posisi yang sudah terbuka **tetap dipantau dan dikelola** (TP/SL, trailing) meskipun waktu sudah keluar dari sesi.
+- Jendela custom mendukung lintas tengah malam (mis. `22:00–02:00`).
+
+### F4 — Trailing Stop
+
+- Toggle **On/Off**; wajib input **Trigger Profit %** dan **Trailing Distance %**.
+- Alur:
+  1. Sebelum profit mencapai trigger → SL tetap (fixed dari mode ATR/persen). Hanya harga ekstrem yang dicatat.
+  2. Saat `profit ≥ Trigger` → SL dipindah ke **harga entry (break-even)**.
+  3. Selanjutnya SL mengikuti harga: `SL = harga ekstrem − trailing distance` (LONG) atau `SL = harga ekstrem + trailing distance` (SHORT).
+- **Aturan mutlak**: SL hanya boleh bergerak menguntungkan (naik untuk LONG, turun untuk SHORT), tidak pernah mundur.
+- **Trailing distance wajib > 0.17%** — di atas biaya round-trip OKX (~0.16%) — agar SL tidak tersentuh hanya karena fee.
+- Update SL memakai `replaceTpSl` (TP lama dipertahankan) dengan cooldown yang sama dengan watchdog, sehingga tidak membombardir OKX saat harga naik terus.
+- Harga ekstrem & status trailing tampil di kartu koin (badge `TRAIL`).
+
 ## Strategi
 
 - Timeframe default: `5m`.
@@ -229,14 +277,18 @@ Server bind ke `0.0.0.0:8080`, lalu buka `http://<ip>:8080`.
 
 Accordron yang tertutup secara default (tidak tergeser saat scroll). Isi:
 
-1. **Margin per Trade (USDT)** — margin per posisi.
+1. **Margin per Trade (USDT)** — margin per posisi (dipakai saat F1 OFF).
 2. **Leverage (1–125x)** — dipakai lewat `set-leverage` sebelum setiap order.
 3. **Metode Penempatan SL/TP** — toggle **Persentase** / **ATR (Volatilitas)**.
    - Mode **Persentase**: input `Stop Loss (%)` dan `Take Profit (%)`.
    - Mode **ATR**: input `Periode ATR` (2–200, default 14) dan `SL = ATR × pengali` (0.1–5, default 1.0). Bidang persen tetap dikirim sebagai fallback.
-4. **5 dropdown instrumen** — 35 koin terverifikasi + `None`.
+4. **F1 Position Sizing** — toggle On/Off, mode `% Saldo` / `Nominal (USDT)`, dengan pratinjau margin efektif dan validasi (≤100% / ≤ saldo).
+5. **F2 Daily Loss Limit** — toggle On/Off, mode `%` / `Nominal USDT`, status PnL harian + batas, dan indikator kunci engine saat limit tercapai.
+6. **F3 Time Filter** — dropdown sesi + input jam custom (UTC) + chip status `SESI AKTIF` / `DI LUAR SESI`.
+7. **F4 Trailing Stop** — toggle On/Off, input trigger & distance, catatan wajib distance > 0.17%.
+8. **5 dropdown instrumen** — 35 koin terverifikasi + `None`.
 
-Kartu **Risk : Reward** dan **Break-even WR** di hero otomatis mengikuti mode (ATR → tetap `1 : 2.00`, WR 33.3%). Kartu koin menampilkan jarak TP/SL aktual per posisi (`tpDistPct`/`slDistPct`) beserta R:R per koin — di mode ATR jaraknya berbeda tiap posisi karena volatilitas berbeda.
+Kartu **Risk : Reward** dan **Break-even WR** di hero otomatis mengikuti mode (ATR → tetap `1 : 2.00`, WR 33.3%). Kartu koin menampilkan jarak TP/SL aktual per posisi (`tpDistPct`/`slDistPct`) beserta R:R per koin — di mode ATR jaraknya berbeda tiap posisi karena volatilitas berbeda. Hero juga menampilkan **Balance (USDT)** dan **PnL hari ini**; bila daily loss limit tercapai muncul banner merah peringatan.
 
 Klik **Save Configuration** untuk menyimpan (accordion menutup otomatis) atau **START/STOP ENGINE**.
 
@@ -260,8 +312,8 @@ URL yang ditampilkan dapat dibuka dari HP. URL gratis berubah setiap kali ngrok 
 
 | Method | Endpoint | Keterangan |
 | --- | --- | --- |
-| `GET` | `/api/state` | Konfigurasi publik, state koin, log, TotalPnL. Secret tidak diserialisasi. |
-| `POST` | `/api/config` | Ubah margin, leverage, 5 instrumen, status engine, timeframe. |
+| `GET` | `/api/state` | Konfigurasi publik, state koin, log, TotalPnL, balance, dailyPnL, lossLimitHit. Secret tidak diserialisasi. |
+| `POST` | `/api/config` | Ubah margin, leverage, 5 instrumen, status engine, timeframe, TP/SL, dan semua fitur F1–F4. |
 | `POST` | `/api/emergency` | Hentikan engine, tutup 100% semua posisi, batalkan algo order. |
 
 Contoh:
@@ -269,10 +321,19 @@ Contoh:
 ```sh
 curl -X POST http://localhost:8080/api/config \
   -H 'Content-Type: application/json' \
-  -d '{"margin":20,"leverage":20,"coins":["SOL-USDT-SWAP","DOGE-USDT-SWAP","XRP-USDT-SWAP","LINK-USDT-SWAP","ADA-USDT-SWAP","none","none","none","none","none"],"isRunning":true,"timeframe":"5m","tpSlMode":"atr","atrPeriod":14,"atrSlMult":1.0,"takeProfitPct":0.8,"stopLossPct":0.4}'
+  -d '{"margin":20,"leverage":20,"coins":["SOL-USDT-SWAP","DOGE-USDT-SWAP","XRP-USDT-SWAP","LINK-USDT-SWAP","ADA-USDT-SWAP","none","none","none","none","none"],"isRunning":true,"timeframe":"5m","tpSlMode":"atr","atrPeriod":14,"atrSlMult":1.0,"takeProfitPct":0.8,"stopLossPct":0.4,"posSizingEnabled":false,"posSizingMode":"pct","posSizingValue":5,"lossLimitEnabled":false,"lossLimitMode":"pct","lossLimitValue":5,"timeFilterMode":"24/7","customStartHour":0,"customEndHour":0,"trailingEnabled":false,"trailingTriggerPct":0.5,"trailingDistPct":0.3}'
 ```
 
 Field TP/SL yang diterima `POST /api/config`: `tpSlMode` (`"percent"`/`"atr"`), `atrPeriod` (2–200), `atrSlMult` (≤ 5), `takeProfitPct`, `stopLossPct` (0–50%, TP ≥ SL, default 0.8/0.4).
+
+Field fitur risiko (F1–F4):
+
+- **F1**: `posSizingEnabled` (bool), `posSizingMode` (`"pct"`/`"fixed"`), `posSizingValue` (persen ≤ 100, atau nominal ≤ saldo).
+- **F2**: `lossLimitEnabled` (bool), `lossLimitMode` (`"pct"`/`"fixed"`), `lossLimitValue` (> 0; maks 100 saat mode `%`).
+- **F3**: `timeFilterMode` (`"24/7"`/`"asian"`/`"london"`/`"newyork"`/`"overlap"`/`"custom"`), `customStartHour`/`customEndHour` (0–23, hanya untuk `custom`).
+- **F4**: `trailingEnabled` (bool), `trailingTriggerPct` (> 0), `trailingDistPct` (> 0.17, maks 20).
+
+Menyimpan config dengan `isRunning: true` ditolak (HTTP 400) bila daily loss limit masih tercapai — restart hanya bisa dilakukan setelah 00:00 UTC, atau dengan menaikkan/menonaktifkan batas.
 
 ## Validasi
 
@@ -293,6 +354,7 @@ Paket belum memiliki test otomatis tersimpan; `go test` hanya memeriksa kompilas
 - **Race detector**: 0 `DATA RACE` selama >90 detik operasi live.
 - **ATR (unit test sementara, sudah dihapus)**: nilai ATR dari OHLC sintetis, jarak SL = ATR×mult, TP = 2× SL, invariant pembulatan (risiko ≤ diminta, hadiah ≥ diminta, R:R ≥ 2), fallback persen tanpa data, clamp min 0.25% & cap anti-likuidasi.
 - **Mode ATR live OKX demo**: level SL = ATR×1.0, TP = 2× jarak SL (R:R 1:2.00), tepat 1 TP + 1 SL per posisi 100% `reduceOnly`, dan watchdog tidak mengubah level di sinkronisasi berikutnya (anti-churn).
+- **F1–F4 live OKX demo**: reject 400 untuk F1 % > 100 / nominal > saldo, F2 nilai ≤ 0, F3 jam custom > 23, F4 distance < 0.17%; F3 sesi London memblokir entry baru (~05:00 UTC, 75 detik tanpa `[EXECUTED]`) namun posisi terbuka tetap dikelola (trailing tetap berjalan); F4 trailing memindah SL ke entry saat profit ≥ trigger lalu mengikuti harga ekstrem (5 koin, `[TRAILING]` di log, SL monotonik naik, 0 churn watchdog); saldo akun & PnL harian muncul di dashboard (diambil dari `/api/v5/account/balance` dan `trade/fills` sejak 00:00 UTC).
 
 ## Keamanan Credential
 

@@ -51,6 +51,42 @@ type Config struct {
 	TpSlMode  string  `json:"tpSlMode"`
 	AtrPeriod int     `json:"atrPeriod"`
 	AtrSlMult float64 `json:"atrSlMult"`
+
+	// --- F1: Position Sizing -------------------------------------------
+	// Mengganti margin tetap (MarginUSDT) saat aktif.
+	//   PosSizingMode "pct"   -> margin = Saldo * PosSizingValue/100
+	//   PosSizingMode "fixed" -> margin = PosSizingValue (USDT)
+	// Saat OFF, margin per trade = MarginUSDT (perilaku lama).
+	PosSizingEnabled bool    `json:"posSizingEnabled"`
+	PosSizingMode    string  `json:"posSizingMode"` // "pct" | "fixed"
+	PosSizingValue   float64 `json:"posSizingValue"`
+
+	// --- F2: Daily Loss Limit ------------------------------------------
+	// Shutdown otomatis + tutup semua posisi bila loss harian (realized +
+	// unrealized, sejak 00:00 UTC) mencapai batas. Reset tiap 00:00 UTC.
+	//   LossLimitMode "pct"  -> batas dihitung dari basis (lihat di bawah)
+	//   LossLimitMode "fixed"-> batas = LossLimitValue USDT
+	// Basis mode "pct": bila F1 aktif -> nilai Position Sizing (hasil F1),
+	// bila F1 OFF -> saldo akun saat ini.
+	LossLimitEnabled bool    `json:"lossLimitEnabled"`
+	LossLimitMode    string  `json:"lossLimitMode"`  // "pct" | "fixed"
+	LossLimitValue   float64 `json:"lossLimitValue"` // default 5 (% atau USDT)
+
+	// --- F3: Time Filter ----------------------------------------------
+	// Bot hanya membuka posisi BARU di dalam jendela sesi (UTC). Posisi yang
+	// sudah terbuka tetap dikelola (TP/SL, trailing) di luar jendela.
+	// TimeFilterMode: "24/7" | "asian" | "london" | "newyork" | "overlap" | "custom"
+	TimeFilterMode  string `json:"timeFilterMode"`
+	CustomStartHour int    `json:"customStartHour"` // UTC, 0-23 (dipakai mode "custom")
+	CustomEndHour   int    `json:"customEndHour"`   // UTC, 0-23 (dipakai mode "custom")
+
+	// --- F4: Trailing Stop ---------------------------------------------
+	// Setelah profit >= TrailingTriggerPct, SL dipindah ke entry (BEP), lalu
+	// mengikuti harga: SL = harga ekstrem - TrailingDistPct. SL hanya bergerak
+	// menguntungkan (naik untuk LONG, turun untuk SHORT), tidak pernah mundur.
+	TrailingEnabled    bool    `json:"trailingEnabled"`
+	TrailingTriggerPct float64 `json:"trailingTriggerPct"` // % profit untuk aktivasi (BEP)
+	TrailingDistPct    float64 `json:"trailingDistPct"`    // % jarak trailing dari ekstrem
 }
 
 // Default TP/SL: rasio risiko:hadiah 1:2 yang BENAR.
@@ -76,6 +112,82 @@ const (
 	minAtrSlPct = 0.25 // SL minimal 0.25% dari entry
 	maxAtrSlPct = 5.0  // SL maksimal 5% dari entry (hard cap)
 )
+
+// --- F2: Daily loss limit → shutdown -------------------------------------
+const (
+	defaultLossLimitValue = 5.0 // default 5%
+
+	// lossLimitCooldown menahan ulang tutup-posisi bila OKX menolak close
+	// (mis. margin tidak cukup), supaya tidak membombardir API tiap 10 detik.
+	lossLimitCooldown = 5 * time.Minute
+)
+
+// --- F3: Time filter — jendela sesi pasar dalam UTC -----------------------
+// Waktu dibuat dalam UTC (acuan utama); konversi ke WIB (UTC+7) hanya
+// untuk tampilan. Definisi sesi adalah perkiraan umum:
+//
+//	Asian 00:00-08:00, London 08:00-16:00, New York 13:00-21:00, overlap 13:00-16:00 UTC.
+const (
+	timeFilter247     = "24/7"
+	timeFilterAsian   = "asian"
+	timeFilterLondon  = "london"
+	timeFilterNewYork = "newyork"
+	timeFilterOverlap = "overlap"
+	timeFilterCustom  = "custom"
+
+	// Jam mulai/selesai sesi (UTC, jam 0-23).
+	asianStart, asianEnd     = 0, 8
+	londonStart, londonEnd   = 8, 16
+	nyStart, nyEnd           = 13, 21
+	overlapStart, overlapEnd = 13, 16
+)
+
+// --- F4: Trailing stop ----------------------------------------------------
+const (
+	// trailingMinDistPct: jarak trailing minimal > biaya round-trip OKX
+	// (~0.16%), agar stop-loss tidak tersentuh hanya karena biaya transaksi.
+	trailingMinDistPct = 0.17
+
+	// trailingMaxDistPct: batas wajar atas jarak trailing.
+	trailingMaxDistPct = 20.0
+)
+
+// sessionWindow mengembalikan jendela sesi (jam UTC, 0-23) untuk mode filter.
+func sessionWindow(cfg Config) (start, end int) {
+	switch cfg.TimeFilterMode {
+	case timeFilterAsian:
+		return asianStart, asianEnd
+	case timeFilterLondon:
+		return londonStart, londonEnd
+	case timeFilterNewYork:
+		return nyStart, nyEnd
+	case timeFilterOverlap:
+		return overlapStart, overlapEnd
+	case timeFilterCustom:
+		return cfg.CustomStartHour, cfg.CustomEndHour
+	default: // "24/7" dan nilai tak dikenal -> selalu terbuka
+		return 0, 24
+	}
+}
+
+// timeFilterActive mengembalikan true bila saat ini (UTC) berada di dalam
+// jendela sesi yang dipilih. Hanya dipakai untuk posisi BARU; posisi terbuka
+// tetap dikelola apa pun hasilnya. Mendukung jendela lintas tengah malam
+// (mis. custom 22:00 - 02:00 → start > end).
+func timeFilterActive(cfg Config) bool {
+	start, end := sessionWindow(cfg)
+	if start == 0 && end == 24 {
+		return true // "24/7"
+	}
+	now := time.Now().UTC()
+	h := float64(now.Hour()) + float64(now.Minute())/60.0
+	if start < end {
+		// Jendela normal dalam satu hari.
+		return h >= float64(start) && h < float64(end)
+	}
+	// Jendela lintas tengah malam (start > end).
+	return h >= float64(start) || h < float64(end)
+}
 
 // pctToFrac mengubah persen menjadi fraksi untuk perkalian harga.
 // 0.8 (persen) -> 0.008 (fraksi). Satu-satunya tempat konversi ini dilakukan.
@@ -127,6 +239,12 @@ type CoinState struct {
 	SlDistPct float64 `json:"slDistPct"`
 	TpSlMode  string  `json:"tpSlMode"` // mode yang terpakai saat TP/SL dipasang
 	AtrUsed   float64 `json:"atrUsed"`  // nilai ATR yang dipakai (0 = mode persen)
+
+	// State trailing stop (F4). TrailActive=true artinya trigger profit sudah
+	// tercapai dan SL dikelola dinamis. TrailExtreme = harga ekstrem sejak
+	// entry (tertinggi utk LONG, terendah utk SHORT).
+	TrailActive  bool    `json:"trailActive"`
+	TrailExtreme float64 `json:"trailExtreme"`
 }
 
 type AppState struct {
@@ -136,6 +254,16 @@ type AppState struct {
 	TotalPnL  float64
 	StartTime time.Time
 	mu        sync.RWMutex
+
+	// Akun & proteksi harian (F1/F2). Diperbarui tiap sinkronisasi dari OKX.
+	Balance  float64 `json:"balance"`  // total equity (USDT)
+	DailyPnL float64 `json:"dailyPnL"` // realized + unrealized sejak 00:00 UTC
+	// LossLimitHit mengunci engine setelah batas loss harian tercapai, sampai
+	// reset 00:00 UTC berikutnya. LossDay = tanggal UTC (YYYY-MM-DD) dari
+	// penghitungan DailyPnL saat ini.
+	LossLimitHit bool      `json:"lossLimitHit"`
+	LossDay      string    `json:"lossDay"`
+	lastLossAct  time.Time // kapan terakhir aksi shutdown karena loss
 }
 
 func loadConfigFromEnv() Config {
@@ -160,20 +288,26 @@ func loadConfigFromEnv() Config {
 	}
 
 	return Config{
-		ApiKey:        apiKey,
-		SecretKey:     secretKey,
-		Passphrase:    passphrase,
-		Mode:          mode,
-		MarginUSDT:    1.0,
-		Leverage:      10,
-		Coins:         [5]string{"BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP", "DOGE-USDT-SWAP", "PEPE-USDT-SWAP"},
-		IsRunning:     false,
-		Timeframe:     "5m",
-		TakeProfitPct: defaultTakeProfitPct,
-		StopLossPct:   defaultStopLossPct,
-		TpSlMode:      tpSlModeATR,
-		AtrPeriod:     defaultAtrPeriod,
-		AtrSlMult:     defaultAtrSlMult,
+		ApiKey:             apiKey,
+		SecretKey:          secretKey,
+		Passphrase:         passphrase,
+		Mode:               mode,
+		MarginUSDT:         1.0,
+		Leverage:           10,
+		Coins:              [5]string{"BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP", "DOGE-USDT-SWAP", "PEPE-USDT-SWAP"},
+		IsRunning:          false,
+		Timeframe:          "5m",
+		TakeProfitPct:      defaultTakeProfitPct,
+		StopLossPct:        defaultStopLossPct,
+		TpSlMode:           tpSlModeATR,
+		AtrPeriod:          defaultAtrPeriod,
+		AtrSlMult:          defaultAtrSlMult,
+		PosSizingMode:      "pct",
+		LossLimitMode:      "pct",
+		LossLimitValue:     defaultLossLimitValue,
+		TimeFilterMode:     timeFilter247,
+		TrailingTriggerPct: 0.5, // aktivasi trailing di profit >= 0.5%
+		TrailingDistPct:    0.3, // jarak trailing 0.3% dari harga ekstrem
 	}
 }
 
@@ -1183,6 +1317,443 @@ func repriceOpenPositionsTpSl(cfg TpSlConfig) {
 }
 
 // ==========================================
+// 2.6 AKUN, RISIKO & FILTER (F1-F4)
+// ==========================================
+
+// effectiveMargin menghitung margin per trade yang dipakai (F1 atau default).
+//
+//	F1 OFF        -> MarginUSDT (perilaku lama)
+//	F1 "pct"      -> Saldo * PosSizingValue / 100
+//	F1 "fixed"    -> PosSizingValue USDT
+//
+// Bila mode "pct" tapi saldo belum diketahui (0), fallback ke MarginUSDT agar
+// order tidak gagal sebelum balance pertama tiba dari OKX.
+func effectiveMargin(cfg Config, balance float64) float64 {
+	if !cfg.PosSizingEnabled {
+		return cfg.MarginUSDT
+	}
+	if cfg.PosSizingMode == "fixed" {
+		return cfg.PosSizingValue
+	}
+	if balance <= 0 {
+		return cfg.MarginUSDT
+	}
+	return balance * cfg.PosSizingValue / 100
+}
+
+// f1modeLabel menghasilkan label ringkas mode Position Sizing untuk log/UI.
+func f1modeLabel(cfg Config) string {
+	if !cfg.PosSizingEnabled {
+		return "default (margin tetap)"
+	}
+	if cfg.PosSizingMode == "fixed" {
+		return fmt.Sprintf("nominal %.2f USDT", cfg.PosSizingValue)
+	}
+	return fmt.Sprintf("%.2f%% saldo", cfg.PosSizingValue)
+}
+
+// fetchAccountBalance mengambil total equity akun (USDT) dari OKX.
+func fetchAccountBalance() (float64, error) {
+	result, err := okxRequest("GET", "/api/v5/account/balance", "")
+	if err != nil {
+		return 0, err
+	}
+	data, _ := result["data"].([]interface{})
+	if len(data) == 0 {
+		return 0, fmt.Errorf("account/balance tidak mengembalikan data")
+	}
+	acc, ok := data[0].(map[string]interface{})
+	if !ok {
+		return 0, fmt.Errorf("account/balance format tidak dikenal")
+	}
+	totalEq, _ := strconv.ParseFloat(toString(acc["totalEq"]), 64)
+	return totalEq, nil
+}
+
+// utcDayStartMillis mengembalikan unix-millis awal hari UTC ini.
+// Semua perhitungan waktu memakai UTC sebagai acuan utama.
+func utcDayStartMillis() int64 {
+	now := time.Now().UTC()
+	start := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	return start.UnixMilli()
+}
+
+// fetchDailyPnL menghitung PnL harian (USDT) sejak 00:00 UTC:
+//
+//	realized   = jumlah pnl fill hari ini (entry fill pnl = 0, tidak dobel)
+//	unrealized = jumlah upl semua posisi terbuka saat ini
+func fetchDailyPnL() (float64, error) {
+	dayStart := utcDayStartMillis()
+	realized := 0.0
+
+	result, err := okxRequest("GET", "/api/v5/trade/fills?instType=SWAP&limit=100", "")
+	if err != nil {
+		return 0, err
+	}
+	if data, ok := result["data"].([]interface{}); ok {
+		for _, item := range data {
+			fill, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			ts, _ := strconv.ParseInt(toString(fill["ts"]), 10, 64)
+			if ts < dayStart {
+				continue // fill hari kemarin -> dihitung ulang setelah reset
+			}
+			pnl, _ := strconv.ParseFloat(toString(fill["pnl"]), 64)
+			if feeCcy, _ := fill["feeCcy"].(string); feeCcy == "USDT" {
+				if fee, err := strconv.ParseFloat(toString(fill["fee"]), 64); err == nil {
+					pnl -= fee
+				}
+			}
+			realized += pnl
+		}
+	}
+
+	unreal := 0.0
+	posResult, err := okxRequest("GET", "/api/v5/account/positions", "")
+	if err != nil {
+		return 0, err
+	}
+	if data, ok := posResult["data"].([]interface{}); ok {
+		for _, item := range data {
+			pos, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			upl, _ := strconv.ParseFloat(toString(pos["upl"]), 64)
+			unreal += upl
+		}
+	}
+	return realized + unreal, nil
+}
+
+// dailyLossLimit menghitung batas loss harian sesuai F2 (dan F1 sebagai basis):
+//
+//	mode "fixed" -> LossLimitValue USDT
+//	mode "pct"   -> basis * LossLimitValue / 100, di mana
+//	                basis = nilai Position Sizing (F1) bila F1 aktif,
+//	                selain itu = saldo akun saat ini.
+//
+// Dipanggil setiap evaluasi sehingga perubahan F1/F2 langsung mengubah batas
+// secara dinamis (sesuai PRD).
+func dailyLossLimit(cfg Config, balance float64) float64 {
+	if !cfg.LossLimitEnabled {
+		return 0
+	}
+	if cfg.LossLimitMode == "fixed" {
+		return cfg.LossLimitValue
+	}
+	base := cfg.MarginUSDT
+	if cfg.PosSizingEnabled {
+		base = effectiveMargin(cfg, balance)
+	} else if balance > 0 {
+		base = balance
+	}
+	return base * cfg.LossLimitValue / 100
+}
+
+// ensureLossDayResetLocked mereset state loss harian bila hari UTC berganti
+// (00:00 UTC). PEMANGGIL wajib memegang state.mu (write lock).
+func ensureLossDayResetLocked() {
+	today := time.Now().UTC().Format("2006-01-02")
+	if state.LossDay != today {
+		state.LossDay = today
+		state.LossLimitHit = false
+		state.DailyPnL = 0
+		state.lastLossAct = time.Time{}
+	}
+}
+
+// shutdownForLoss menutup SEMUA posisi, membatalkan order TP/SL pending,
+// menghentikan engine, dan mengunci start sampai reset 00:00 UTC.
+// Mengembalikan true bila semua posisi berhasil ditutup (LossLimitHit di-set).
+func shutdownForLoss(cfg Config) bool {
+	state.mu.Lock()
+	positions := make([]string, 0)
+	for symbol, coin := range state.Coins {
+		if coin.Position != "NONE" {
+			positions = append(positions, symbol)
+		}
+	}
+	state.Config.IsRunning = false
+	state.mu.Unlock()
+
+	if len(positions) == 0 {
+		state.mu.Lock()
+		state.LossLimitHit = true
+		state.lastLossAct = time.Now()
+		state.mu.Unlock()
+		addLog("[LOSS LIMIT] Batas loss harian tercapai. Engine dihentikan (tidak ada posisi terbuka). Engine terkunci sampai 00:00 UTC.")
+		return true
+	}
+
+	allClosed := true
+	for _, symbol := range positions {
+		if err := closePosition(symbol, ""); err != nil {
+			allClosed = false
+			addLog(fmt.Sprintf("[LOSS LIMIT ERROR] Gagal tutup %s: %v", symbol, err))
+			continue
+		}
+		openPosMu.Lock()
+		delete(openPositions, symbol)
+		openPosMu.Unlock()
+		state.mu.Lock()
+		if coin := state.Coins[symbol]; coin != nil {
+			coin.Position = "NONE"
+			coin.EntryPrice = 0
+			coin.Contracts = 0
+			coin.HasTPSL = false
+		}
+		state.mu.Unlock()
+		addLog(fmt.Sprintf("[LOSS LIMIT] Posisi %s ditutup penuh", symbol))
+	}
+	cancelPendingAlgoOrders("LOSS LIMIT")
+
+	if allClosed {
+		state.mu.Lock()
+		state.LossLimitHit = true
+		state.lastLossAct = time.Now()
+		state.mu.Unlock()
+		addLog("[LOSS LIMIT] Semua posisi ditutup dan engine dihentikan. Engine terkunci sampai reset 00:00 UTC.")
+	} else {
+		// Tetap catat waktu percobaan agar percobaan ulang dibatasi cooldown
+		// (tidak membombardir OKX tiap 10 detik saat close gagal).
+		state.mu.Lock()
+		state.lastLossAct = time.Now()
+		state.mu.Unlock()
+		addLog("[LOSS LIMIT] Sebagian posisi gagal ditutup; percobaan akan diulang pada sinkronisasi berikutnya.")
+	}
+	return allClosed
+}
+
+// refreshAccountData memperbarui saldo akun + PnL harian dari OKX lalu
+// mengevaluasi batas loss harian (F2). Dipanggil tiap 10 detik.
+// Aksi shutdown hanya dieksekusi bila batas tercapai; log peringatan dibatasi
+// supaya tidak membanjiri logbox saat OKX bermasalah.
+var lastAccountWarn time.Time
+
+func refreshAccountData() {
+	balance, err := fetchAccountBalance()
+	if err == nil {
+		state.mu.Lock()
+		state.Balance = balance
+		state.mu.Unlock()
+	} else if time.Since(lastAccountWarn) > 5*time.Minute {
+		lastAccountWarn = time.Now()
+		addLog(fmt.Sprintf("[WARN] Gagal ambil saldo akun: %v", err))
+	}
+
+	daily, err := fetchDailyPnL()
+	if err != nil {
+		if time.Since(lastAccountWarn) > 5*time.Minute {
+			lastAccountWarn = time.Now()
+			addLog(fmt.Sprintf("[WARN] Gagal hitung PnL harian: %v", err))
+		}
+		return
+	}
+
+	state.mu.Lock()
+	ensureLossDayResetLocked()
+	state.DailyPnL = daily
+	cfg := state.Config
+	hit := state.LossLimitHit
+	lastAct := state.lastLossAct
+	state.mu.Unlock()
+
+	if !cfg.LossLimitEnabled || hit || daily > -1e-12 {
+		return
+	}
+	limit := dailyLossLimit(cfg, balance)
+	if limit <= 0 || daily > -limit {
+		return
+	}
+	// Breach dipastikan berulang (cooldown) kalau tutup posisi gagal.
+	if time.Since(lastAct) < lossLimitCooldown {
+		return
+	}
+	addLog(fmt.Sprintf("[LOSS LIMIT] PnL harian %.4f USDT mencapai batas -%.4f USDT → shutdown otomatis", daily, limit))
+	shutdownForLoss(cfg)
+}
+
+// roundTickDown membulatkan harga ke bawah ke kelipatan tick (LONG SL).
+func roundTickDown(px, tick float64) float64 {
+	if tick <= 0 {
+		return px
+	}
+	return math.Floor(px/tick+1e-9) * tick
+}
+
+// roundTickUp membulatkan harga ke atas ke kelipatan tick (SHORT SL).
+func roundTickUp(px, tick float64) float64 {
+	if tick <= 0 {
+		return px
+	}
+	return math.Ceil(px/tick-1e-9) * tick
+}
+
+// manageTrailing mengelola trailing stop (F4) untuk satu posisi terbuka.
+// Dipanggil dari sinkronisasi posisi (tiap 10 detik) memakai harga mark OKX.
+//
+// Aturan PRD:
+//  1. profit >= TriggerProfit% -> SL dipindah ke entry (break-even point).
+//  2. harga terus bergerak      -> SL = harga ekstrem ± TrailingDistance.
+//  3. SL hanya boleh bergerak MENGUNTUNGKAN (naik utk LONG, turun utk SHORT),
+//     tidak pernah mundur.
+//  4. profit belum mencapai trigger -> SL tetap (fixed dari ATR/persen, tidak
+//     diubah), hanya harga ekstrem yang dicatat.
+//
+// Pembaruan lewat replaceTpSl (batal + pasang ulang TP & SL) dengan TP lama
+// dipertahankan, dan memakai cooldown yang sama dengan watchdog supaya bot
+// tidak membombardir OKX ketika harga naik terus menerus.
+func manageTrailing(symbol, side string, positionSize, entryPrice, markPx float64, cfg Config) {
+	if !cfg.TrailingEnabled || positionSize <= 0 || entryPrice <= 0 || markPx <= 0 {
+		return
+	}
+	spec, ok := getInstrumentSpec(symbol)
+	if !ok {
+		return
+	}
+
+	// Jangan bentrok dengan watchdog / reprice yang sedang memperbaiki simbol ini.
+	if !acquireTpSlLock(symbol) {
+		return
+	}
+	defer releaseTpSlLock(symbol)
+
+	info, err := fetchPendingTpSl(symbol)
+	if err != nil || !info.HaveSl {
+		return // tanpa SL terpasang, trailing tidak beroperasi
+	}
+	currentSL := info.SlPx
+
+	state.mu.RLock()
+	coin := state.Coins[symbol]
+	trailActive := false
+	extreme := markPx
+	keptTP := info.TpPx
+	keptTpDist := 0.0
+	keptMode := cfg.TpSlMode
+	keptAtr := 0.0
+	if coin != nil {
+		trailActive = coin.TrailActive
+		if coin.TrailExtreme > 0 {
+			extreme = coin.TrailExtreme
+		}
+		if coin.TpPrice > 0 {
+			keptTP = coin.TpPrice
+		}
+		keptTpDist = coin.TpDistPct
+		if coin.TpSlMode != "" {
+			keptMode = coin.TpSlMode
+		}
+		keptAtr = coin.AtrUsed
+	}
+	state.mu.RUnlock()
+
+	// Profit % dari entry ke mark (positif = profit).
+	profitPct := 0.0
+	if side == "short" {
+		profitPct = (entryPrice - markPx) / entryPrice * 100
+	} else {
+		profitPct = (markPx - entryPrice) / entryPrice * 100
+	}
+
+	// Harga ekstrem sejak entry: tertinggi utk LONG, terendah utk SHORT.
+	newExtreme := extreme
+	if side == "short" {
+		if markPx < newExtreme {
+			newExtreme = markPx
+		}
+	} else {
+		if markPx > newExtreme {
+			newExtreme = markPx
+		}
+	}
+
+	if !trailActive && profitPct < cfg.TrailingTriggerPct {
+		// Trigger belum tercapai: catat ekstrem, biarkan SL fixed.
+		state.mu.Lock()
+		if c := state.Coins[symbol]; c != nil {
+			c.TrailExtreme = newExtreme
+		}
+		state.mu.Unlock()
+		return
+	}
+
+	// Hitung SL target. Saat baru aktif, SL pindah ke entry (BEP).
+	var wantSL float64
+	if side == "short" {
+		if !trailActive {
+			wantSL = entryPrice
+		} else {
+			wantSL = newExtreme * (1 + pctToFrac(cfg.TrailingDistPct))
+		}
+	} else {
+		if !trailActive {
+			wantSL = entryPrice
+		} else {
+			wantSL = newExtreme * (1 - pctToFrac(cfg.TrailingDistPct))
+		}
+	}
+	// Bulatkan ke tick MENJAUH dari harga saat ini (LONG ke bawah, SHORT ke
+	// atas) supaya jarak aktual >= TrailingDistPct dan tidak kena noise.
+	if side == "short" {
+		wantSL = roundTickUp(wantSL, spec.TickSz)
+	} else {
+		wantSL = roundTickDown(wantSL, spec.TickSz)
+	}
+
+	// Aturan mutlak: SL hanya boleh bergerak MENGUNTUNGKAN.
+	if side == "short" {
+		if wantSL > currentSL {
+			wantSL = currentSL
+		}
+	} else {
+		if wantSL < currentSL {
+			wantSL = currentSL
+		}
+	}
+
+	// Tidak ada perubahan berarti -> cukup perbarui state trailing.
+	tol := spec.TickSz / 2
+	if tol < 1e-12 {
+		tol = 1e-12
+	}
+	state.mu.Lock()
+	if c := state.Coins[symbol]; c != nil {
+		c.TrailActive = true
+		c.TrailExtreme = newExtreme
+	}
+	state.mu.Unlock()
+	if math.Abs(wantSL-currentSL) <= tol {
+		return
+	}
+
+	// Cooldown yang sama dengan watchdog: hindari pasang ulang berlebihan.
+	if tpslRecentlyFixed(symbol) {
+		return
+	}
+
+	slDist := math.Abs(wantSL-entryPrice) / entryPrice * 100
+	calc := TpSlCalc{
+		TpPx:        keptTP,
+		SlPx:        wantSL,
+		Mode:        keptMode,
+		AtrVal:      keptAtr,
+		TpDistPct:   keptTpDist,
+		SlDistPct:   slDist,
+		UsedPercent: keptMode != tpSlModeATR,
+	}
+	if !replaceTpSl(symbol, side, positionSize, calc) {
+		return
+	}
+	markTpSlFixed(symbol)
+	addLog(fmt.Sprintf("[TRAILING] %s %s: SL naik ke %s (ekstrem %s, jarak %.2f%%) — trailing aktif",
+		symbol, strings.ToUpper(side), formatPx(wantSL, spec), formatPx(newExtreme, spec), cfg.TrailingDistPct))
+}
+
+// ==========================================
 // 2.5 POSITION SYNC & MANAGEMENT
 // ==========================================
 
@@ -1222,11 +1793,13 @@ func syncPositionsWithOKX() {
 		avgPxStr, _ := pos["avgPx"].(string)
 		posStr, _ := pos["pos"].(string)
 		uplRatioStr, _ := pos["uplRatio"].(string)
+		markPxStr, _ := pos["markPx"].(string)
 		imrStr, _ := pos["imr"].(string)
 
 		avgPrice, _ := strconv.ParseFloat(avgPxStr, 64)
 		posSize, _ := strconv.ParseFloat(posStr, 64)
 		uplRatio, _ := strconv.ParseFloat(uplRatioStr, 64)
+		markPx, _ := strconv.ParseFloat(markPxStr, 64)
 		imr, _ := strconv.ParseFloat(imrStr, 64)
 
 		if avgPrice <= 0 || math.Abs(posSize) < 1e-12 {
@@ -1255,6 +1828,9 @@ func syncPositionsWithOKX() {
 		coin.Contracts = info.Size
 		coin.PnL = uplRatio * 100 // persen, sama persis dengan tampilan OKX
 		coin.Leverage = state.Config.Leverage
+		if markPx <= 0 {
+			markPx = coin.Price // fallback harga WS bila mark belum tersedia
+		}
 		state.mu.Unlock()
 
 		// addLog mengunci state.mu sendiri, jadi HARUS dipanggil setelah Unlock.
@@ -1266,6 +1842,17 @@ func syncPositionsWithOKX() {
 		// ensureTPSL hanya melakukan 1 panggilan API (orders-algo-pending) dan
 		// keluar tanpa log bila TP/SL sudah ada, sehingga aman dipanggil tiap sync.
 		go ensureTPSL(instId, strings.ToLower(side), info.Size, avgPrice, snapshotTpSlConfig())
+
+		// Trailing stop (F4): kelola SL dinamis bila konfigurasi aktif.
+		// Memakai harga mark dari OKX (bukan WS) supaya konsisten dengan posisi.
+		snapshotFull := func() Config {
+			state.mu.RLock()
+			defer state.mu.RUnlock()
+			return state.Config
+		}()
+		if snapshotFull.TrailingEnabled {
+			manageTrailing(instId, strings.ToLower(side), info.Size, avgPrice, markPx, snapshotFull)
+		}
 	}
 
 	// Deteksi posisi yang baru saja tertutup oleh TP/SL OKX
@@ -1674,17 +2261,26 @@ func checkTradingSignal(symbol string, currentPrice float64) {
 
 	// Snapshot konfigurasi TANPA lock ditahan saat request dikirim ke OKX.
 	// Nilai inilah yang dipakai untuk order, jadi UI dan order selalu identik.
-	margin := state.Config.MarginUSDT
-	leverage := state.Config.Leverage
-	isRunning := state.Config.IsRunning
+	balance := state.Balance
+	cfgSnapshot := state.Config
+	margin := effectiveMargin(cfgSnapshot, balance)
+	leverage := cfgSnapshot.Leverage
+	isRunning := cfgSnapshot.IsRunning
 	if !isRunning {
+		state.mu.Unlock()
+		return
+	}
+
+	// Time filter (F3): posisi BARU hanya boleh dibuka di dalam jendela sesi
+	// (UTC). Posisi terbuka TIDAK terpengaruh — tetap dikelola di luar jendela.
+	if !timeFilterActive(cfgSnapshot) {
 		state.mu.Unlock()
 		return
 	}
 
 	// Hanya koin yang masih ada di watchlist yang boleh entry.
 	inWatchlist := false
-	for _, sym := range state.Config.Coins {
+	for _, sym := range cfgSnapshot.Coins {
 		if sym == symbol {
 			inWatchlist = true
 			break
@@ -1697,18 +2293,18 @@ func checkTradingSignal(symbol string, currentPrice float64) {
 
 	// Snapshot TP/SL dari konfigurasi. Nilai ini yang dipakai untuk order,
 	// sehingga tidak mungkin berbeda dari yang tampil di dashboard.
-	tpPct := state.Config.TakeProfitPct
-	slPct := state.Config.StopLossPct
+	tpPct := cfgSnapshot.TakeProfitPct
+	slPct := cfgSnapshot.StopLossPct
 	if tpPct <= 0 || slPct <= 0 {
 		state.mu.Unlock()
 		return
 	}
-	tpMode := state.Config.TpSlMode
+	tpMode := cfgSnapshot.TpSlMode
 	if tpMode != tpSlModeATR {
 		tpMode = tpSlModePercent
 	}
-	atrPeriod := state.Config.AtrPeriod
-	atrSlMult := state.Config.AtrSlMult
+	atrPeriod := cfgSnapshot.AtrPeriod
+	atrSlMult := cfgSnapshot.AtrSlMult
 
 	// Perbarui pratinjau ukuran order di UI
 	plan := calculateOrderSize(symbol, currentPrice, margin, leverage)
@@ -1947,19 +2543,25 @@ func handleGetState(w http.ResponseWriter, r *http.Request) {
 			newSymbols = append(newSymbols, sym)
 		}
 		// Pratinjau order dihitung dengan harga TERKINI sehingga angka di UI
-		// sama persis dengan yang akan dikirim ke OKX.
+		// sama persis dengan yang akan dikirim ke OKX. Margin memakai
+		// effectiveMargin (F1) bila position sizing aktif.
 		coin := state.Coins[sym]
-		plan := calculateOrderSize(sym, coin.Price, state.Config.MarginUSDT, state.Config.Leverage)
+		effMargin := effectiveMargin(state.Config, state.Balance)
+		plan := calculateOrderSize(sym, coin.Price, effMargin, state.Config.Leverage)
 		applyOrderPlan(coin, plan, state.Config.Leverage)
 	}
 
 	response := struct {
-		Config    Config
-		Coins     map[string]*CoinState
-		Logs      []string
-		TotalPnL  float64
-		StartTime time.Time
-	}{Config: state.Config, Coins: make(map[string]*CoinState, len(state.Coins)), Logs: append([]string(nil), state.Logs...), TotalPnL: state.TotalPnL, StartTime: state.StartTime}
+		Config       Config
+		Coins        map[string]*CoinState
+		Logs         []string
+		TotalPnL     float64
+		StartTime    time.Time
+		Balance      float64 `json:"balance"`      // total equity USDT (F1/F2 basis)
+		DailyPnL     float64 `json:"dailyPnL"`     // PnL harian sejak 00:00 UTC
+		LossLimitHit bool    `json:"lossLimitHit"` // engine terkunci karena loss harian
+		LossDay      string  `json:"lossDay"`      // tanggal UTC dari penghitungan harian
+	}{Config: state.Config, Coins: make(map[string]*CoinState, len(state.Coins)), Logs: append([]string(nil), state.Logs...), TotalPnL: state.TotalPnL, StartTime: state.StartTime, Balance: state.Balance, DailyPnL: state.DailyPnL, LossLimitHit: state.LossLimitHit, LossDay: state.LossDay}
 	for symbol, coin := range state.Coins {
 		coinCopy := *coin
 		response.Coins[symbol] = &coinCopy
@@ -2038,6 +2640,115 @@ func handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// --- Validasi F1: Position Sizing -----------------------------------
+	if newConfig.PosSizingMode == "" {
+		newConfig.PosSizingMode = "pct"
+	}
+	if newConfig.PosSizingMode != "pct" && newConfig.PosSizingMode != "fixed" {
+		http.Error(w, "posSizingMode must be \"pct\" or \"fixed\"", 400)
+		return
+	}
+	if newConfig.PosSizingEnabled {
+		if newConfig.PosSizingMode == "pct" {
+			if newConfig.PosSizingValue <= 0 || newConfig.PosSizingValue > 100 {
+				http.Error(w, "position sizing % must be between 0 and 100", 400)
+				return
+			}
+		} else {
+			if newConfig.PosSizingValue <= 0 {
+				http.Error(w, "fixed position sizing must be positive (USDT)", 400)
+				return
+			}
+			// Nominal tidak boleh melebihi saldo akun (bila saldo sudah diketahui).
+			state.mu.RLock()
+			bal := state.Balance
+			state.mu.RUnlock()
+			if bal > 0 && newConfig.PosSizingValue > bal {
+				http.Error(w, fmt.Sprintf("fixed position sizing $%.2f exceeds account balance $%.2f", newConfig.PosSizingValue, bal), 400)
+				return
+			}
+		}
+	}
+
+	// --- Validasi F2: Daily Loss Limit ----------------------------------
+	if newConfig.LossLimitMode == "" {
+		newConfig.LossLimitMode = "pct"
+	}
+	if newConfig.LossLimitMode != "pct" && newConfig.LossLimitMode != "fixed" {
+		http.Error(w, "lossLimitMode must be \"pct\" or \"fixed\"", 400)
+		return
+	}
+	if newConfig.LossLimitEnabled {
+		if newConfig.LossLimitValue <= 0 {
+			http.Error(w, "loss limit value must be positive", 400)
+			return
+		}
+		if newConfig.LossLimitMode == "pct" && newConfig.LossLimitValue > 100 {
+			http.Error(w, "loss limit % must be at most 100", 400)
+			return
+		}
+	}
+
+	// --- Validasi F3: Time Filter ---------------------------------------
+	if newConfig.TimeFilterMode == "" {
+		newConfig.TimeFilterMode = timeFilter247
+	}
+	switch newConfig.TimeFilterMode {
+	case timeFilter247, timeFilterAsian, timeFilterLondon, timeFilterNewYork, timeFilterOverlap:
+		// jendela bawaan, valid
+	case timeFilterCustom:
+		if newConfig.CustomStartHour < 0 || newConfig.CustomStartHour > 23 ||
+			newConfig.CustomEndHour < 0 || newConfig.CustomEndHour > 23 {
+			http.Error(w, "custom session hours must be between 0 and 23 (UTC)", 400)
+			return
+		}
+	default:
+		http.Error(w, "unknown timeFilterMode", 400)
+		return
+	}
+
+	// --- Validasi F4: Trailing Stop -------------------------------------
+	if newConfig.TrailingEnabled {
+		if newConfig.TrailingTriggerPct <= 0 {
+			http.Error(w, "trailing trigger profit must be positive", 400)
+			return
+		}
+		// Jarak trailing wajib > biaya round-trip OKX (~0.16%) agar stop-loss
+		// tidak tersentuh hanya karena fee transaksi (PRD F4).
+		if newConfig.TrailingDistPct < trailingMinDistPct {
+			http.Error(w, fmt.Sprintf("trailing distance must be greater than %.2f%% (OKX round-trip fee ~0.16%%)", trailingMinDistPct), 400)
+			return
+		}
+		if newConfig.TrailingDistPct > trailingMaxDistPct {
+			http.Error(w, "trailing distance must be at most 20%", 400)
+			return
+		}
+	}
+
+	// --- Kunci restart bila batas loss harian tercapai (F2) -------------
+	if newConfig.IsRunning {
+		state.mu.Lock()
+		ensureLossDayResetLocked()
+		wasHit := state.LossLimitHit
+		daily := state.DailyPnL
+		bal := state.Balance
+		state.mu.Unlock()
+		if wasHit && newConfig.LossLimitEnabled {
+			limit := dailyLossLimit(newConfig, bal)
+			if limit > 0 && daily <= -limit {
+				http.Error(w, fmt.Sprintf(
+					"daily loss limit reached: PnL %.4f USDT vs limit -%.4f USDT. Engine locked until 00:00 UTC — naikkan/nonaktifkan batas untuk restart.",
+					daily, limit), 400)
+				return
+			}
+			// Batas dinaikkan / loss sudah pulih -> buka kunci.
+			state.mu.Lock()
+			state.LossLimitHit = false
+			state.mu.Unlock()
+			addLog("[LOSS LIMIT] Batas loss harian dinaikkan/dinonaktifkan; kunci engine dibuka.")
+		}
+	}
+
 	// Build new coin list (filter out "none" and empty)
 	//同时 saring instrumen yang tidak ada di OKX (delisted / typo) agar bot
 	//tidak pernah mencoba order pada instrumen yang tidak valid.
@@ -2095,6 +2806,26 @@ func handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	state.Config.AtrPeriod = newConfig.AtrPeriod
 	state.Config.AtrSlMult = newConfig.AtrSlMult
 
+	// --- F1: Position Sizing ---
+	state.Config.PosSizingEnabled = newConfig.PosSizingEnabled
+	state.Config.PosSizingMode = newConfig.PosSizingMode
+	state.Config.PosSizingValue = newConfig.PosSizingValue
+
+	// --- F2: Daily Loss Limit ---
+	state.Config.LossLimitEnabled = newConfig.LossLimitEnabled
+	state.Config.LossLimitMode = newConfig.LossLimitMode
+	state.Config.LossLimitValue = newConfig.LossLimitValue
+
+	// --- F3: Time Filter ---
+	state.Config.TimeFilterMode = newConfig.TimeFilterMode
+	state.Config.CustomStartHour = newConfig.CustomStartHour
+	state.Config.CustomEndHour = newConfig.CustomEndHour
+
+	// --- F4: Trailing Stop ---
+	state.Config.TrailingEnabled = newConfig.TrailingEnabled
+	state.Config.TrailingTriggerPct = newConfig.TrailingTriggerPct
+	state.Config.TrailingDistPct = newConfig.TrailingDistPct
+
 	// Tentukan simbol yang tidak lagi dipilih, TETAPI posisi yang masih terbuka
 	// di OKX tetap dipertahankan agar PnL & TP/SL tidak hilang dari dashboard.
 	stillTracked := make(map[string]bool, len(newCoins))
@@ -2138,6 +2869,30 @@ func handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 		strings.ToUpper(newConfig.TpSlMode), newConfig.TakeProfitPct, newConfig.StopLossPct,
 		newConfig.AtrPeriod, newConfig.AtrSlMult, newConfig.RiskReward(), newConfig.BreakEvenWinRate()))
 
+	// Ringkasan fitur risiko (F1-F4) di log, agar perilaku aktif selalu jelas.
+	feat := make([]string, 0, 4)
+	if newConfig.PosSizingEnabled {
+		if newConfig.PosSizingMode == "fixed" {
+			feat = append(feat, fmt.Sprintf("Size=%.2f USDT", newConfig.PosSizingValue))
+		} else {
+			feat = append(feat, fmt.Sprintf("Size=%.2f%% saldo", newConfig.PosSizingValue))
+		}
+	}
+	if newConfig.LossLimitEnabled {
+		if newConfig.LossLimitMode == "fixed" {
+			feat = append(feat, fmt.Sprintf("Loss=%.2f USDT", newConfig.LossLimitValue))
+		} else {
+			feat = append(feat, fmt.Sprintf("Loss=%.2f%%", newConfig.LossLimitValue))
+		}
+	}
+	feat = append(feat, fmt.Sprintf("Sesi=%s", strings.ToUpper(newConfig.TimeFilterMode)))
+	if newConfig.TrailingEnabled {
+		feat = append(feat, fmt.Sprintf("Trailing=%.2f%%/%.2f%%", newConfig.TrailingTriggerPct, newConfig.TrailingDistPct))
+	}
+	if len(feat) > 0 {
+		addLog("CONFIG Risiko: " + strings.Join(feat, " | "))
+	}
+
 	// Posisi yang sudah terbuka memakai TP/SL lama. Supaya konfigurasi UI
 	// selalu berlaku untuk semua posisi, harga TP/SL di-reprice sesuai
 	// konfigurasi baru (persen atau ATR terkini).
@@ -2153,8 +2908,12 @@ func handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if newConfig.IsRunning {
-		addLog(fmt.Sprintf("CONFIG: Bot STARTED | Margin $%.2f/trade | %dx leverage | %d koin: %s",
-			newConfig.MarginUSDT, newConfig.Leverage, len(newCoins), strings.Join(newCoins, ", ")))
+		state.mu.RLock()
+		bal := state.Balance
+		state.mu.RUnlock()
+		effMargin := effectiveMargin(newConfig, bal)
+		addLog(fmt.Sprintf("CONFIG: Bot STARTED | Margin $%.2f/trade (F1 %s) | %dx leverage | %d koin: %s",
+			effMargin, f1modeLabel(newConfig), newConfig.Leverage, len(newCoins), strings.Join(newCoins, ", ")))
 		state.mu.Lock()
 		state.StartTime = time.Now()
 		state.mu.Unlock()
@@ -2207,7 +2966,7 @@ func handleEmergencyClose(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Batalkan semua order TP/SL yang masih menggantung agar tidak memicu order reversal
-	cancelPendingAlgoOrders()
+	cancelPendingAlgoOrders("EMERGENCY")
 
 	// Close all WebSocket connections
 	state.mu.Lock()
@@ -2253,8 +3012,9 @@ func cancelAlgoOrdersFor(symbol string) error {
 	return lastErr
 }
 
-// cancelPendingAlgoOrders membatalkan seluruh order TP/SL conditional yang menggantung
-func cancelPendingAlgoOrders() {
+// cancelPendingAlgoOrders membatalkan seluruh order TP/SL conditional yang menggantung.
+// label dipakai di pesan log (mis. "EMERGENCY" atau "LOSS LIMIT").
+func cancelPendingAlgoOrders(label string) {
 	result, err := okxRequest("GET", "/api/v5/trade/orders-algo-pending?ordType=conditional&instType=SWAP", "")
 	if err != nil {
 		return
@@ -2275,7 +3035,7 @@ func cancelPendingAlgoOrders() {
 			addLog(fmt.Sprintf("[WARN] Gagal batalkan algo %s: %v", algoId, err))
 		}
 	}
-	addLog("[EMERGENCY] Semua order TP/SL pending dibatalkan")
+	addLog(fmt.Sprintf("[%s] Semua order TP/SL pending dibatalkan", label))
 }
 
 // ==========================================
@@ -2315,12 +3075,17 @@ func main() {
 
 	// Sync positions with OKX on startup
 	go syncPositionsWithOKX()
+	// Muat data akun (saldo + PnL harian) sekali di awal untuk UI & F1/F2.
+	refreshAccountData()
 
 	// Sinkronisasi berkala: memastikan posisi, ukuran kontrak, dan PnL di dashboard
 	// selalu sama dengan OKX, serta mendeteksi exit yang dieksekusi order TP/SL OKX.
 	go func() {
 		for {
 			time.Sleep(10 * time.Second)
+			// Saldo & PnL harian dipantau terus (dipakai F1/F2 dan tampilan UI),
+			// termasuk saat engine berhenti — posisi terbuka tetap bisa rugi.
+			refreshAccountData()
 			state.mu.RLock()
 			running := state.Config.IsRunning
 			state.mu.RUnlock()
@@ -2337,7 +3102,7 @@ func main() {
 
 	fmt.Println("========================================")
 	fmt.Printf("  OKX SCALPER PRO (%s MODE)\n", strings.ToUpper(state.Config.Mode))
-	fmt.Println("  UI Ready at: http://103.186.30.230:8080")
+	fmt.Println("  UI Ready at: http://localhost:8080")
 	fmt.Println("========================================")
 
 	log.Fatal(http.ListenAndServe("0.0.0.0:8080", nil))
@@ -2617,6 +3382,28 @@ const uiTemplate = `
         .chip-long { background: color-mix(in srgb, var(--accent) 14%, transparent); color: var(--accent); border-color: color-mix(in srgb, var(--accent) 32%, transparent); }
         .chip-short { background: color-mix(in srgb, var(--negative) 12%, transparent); color: var(--negative); border-color: color-mix(in srgb, var(--negative) 30%, transparent); }
         .chip-idle { background: var(--pane); color: var(--text-subtle); border-color: var(--pane-border); }
+        .chip-trail { background: color-mix(in srgb, var(--warning) 14%, transparent); color: var(--warning); border-color: color-mix(in srgb, var(--warning) 34%, transparent); }
+        .chip-lock { background: color-mix(in srgb, var(--negative) 12%, transparent); color: var(--negative); border-color: color-mix(in srgb, var(--negative) 32%, transparent); }
+
+        /* Toggle switch untuk fitur On/Off (F1, F2, F4) */
+        .switch { position: relative; display: inline-flex; align-items: center; flex-shrink: 0; cursor: pointer; }
+        .switch .switch-track {
+            position: relative; width: 44px; height: 25px; border-radius: 9999px;
+            background: var(--pane-border); border: 1px solid var(--outline-strong);
+            transition: background 0.25s ease, border-color 0.25s ease;
+        }
+        .switch .switch-track::after {
+            content: ''; position: absolute; top: 2px; left: 2px; width: 19px; height: 19px;
+            border-radius: 50%; background: var(--surface-2);
+            box-shadow: 0 2px 5px rgba(15,23,42,0.35);
+            transition: transform 0.25s ease;
+        }
+        .switch input:checked + .switch-track {
+            background: linear-gradient(135deg, var(--accent) 0%, var(--accent-2) 100%);
+            border-color: transparent;
+        }
+        .switch input:checked + .switch-track::after { transform: translateX(19px); }
+        .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
 
         .badge { display: inline-block; padding: 0.2rem 0.5rem; border-radius: 0.45rem; font-size: 10px; font-weight: 700; }
         .badge-ok { background: color-mix(in srgb, var(--positive) 14%, transparent); color: var(--positive); }
@@ -2751,7 +3538,17 @@ const uiTemplate = `
                 <p class="text-xs t-subtle mt-1.5" x-text="totalPnL >= 0 ? 'Bot berjalan profit' : 'Bot berjalan merugi'"></p>
             </div>
 
-            <div class="xl:col-span-8 grid grid-cols-2 lg:grid-cols-4 gap-3">
+            <div class="xl:col-span-8 grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-3">
+                <div class="tile">
+                    <p class="eyebrow">Balance (USDT)</p>
+                    <p class="mono text-sm font-bold mt-1.5" x-text="'$' + balance.toFixed(2)"></p>
+                </div>
+                <div class="tile">
+                    <p class="eyebrow">PnL Hari Ini</p>
+                    <p class="mono text-sm font-bold mt-1.5" :class="dailyPnL >= 0 ? 't-pos' : 't-neg'">
+                        <span x-text="dailyPnL >= 0 ? '+' : ''"></span><span x-text="dailyPnL.toFixed(2)"></span>
+                    </p>
+                </div>
                 <div class="tile">
                     <p class="eyebrow">Started</p>
                     <p class="mono text-sm font-bold mt-1.5" x-text="startTime ? new Date(startTime).toLocaleString([], { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) : '-'"></p>
@@ -2770,6 +3567,12 @@ const uiTemplate = `
                 </div>
             </div>
         </div>
+
+        <!-- Peringatan besar saat daily loss limit tercapai (F2) -->
+        <div x-show="lossLimitHit" class="mt-4 bg-red-500/10 border border-red-500/30 rounded-2xl px-4 py-3 flex items-center gap-3 relative">
+            <svg class="w-5 h-5 text-red-500 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
+            <p class="text-sm font-bold text-red-500">DAILY LOSS LIMIT HIT — engine terkunci sampai 00:00 UTC. Semua posisi ditutup otomatis. Naikkan/nonaktifkan batas loss di konfigurasi untuk restart.</p>
+        </div>
     </section>
 
     <div class="grid grid-cols-1 lg:grid-cols-12 gap-5 md:gap-6">
@@ -2784,7 +3587,7 @@ const uiTemplate = `
                         </div>
                         <div class="min-w-0">
                             <h2 class="text-base font-bold truncate">Trade Configuration</h2>
-                            <p class="eyebrow mt-0.5" x-text="margin + ' USDT • ' + leverage + 'x leverage'"></p>
+                            <p class="eyebrow mt-0.5" x-text="posSizingEnabled ? effPositionMargin().toFixed(2) + ' USDT (F1) • ' + leverage + 'x leverage' : margin + ' USDT • ' + leverage + 'x leverage'"></p>
                         </div>
                     </div>
                     <svg class="w-5 h-5 t-subtle shrink-0 transition-transform duration-300" :class="configOpen ? 'rotate-180' : ''" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
@@ -2796,7 +3599,155 @@ const uiTemplate = `
                         <div>
                             <label class="eyebrow block mb-2">Margin per Trade (USDT)</label>
                             <input type="number" step="0.1" x-model.number="margin" class="field mono font-bold text-lg">
+                            <p class="text-[11px] t-subtle mt-1.5 leading-relaxed">Dipakai bila <b>Position Sizing (F1)</b> di bawah dalam keadaan OFF. Saat F1 aktif, margin mengikuti F1.</p>
                         </div>
+
+                        <div class="rule"></div>
+
+                        <!-- ======== F1: POSITION SIZING ======== -->
+                        <div class="tile">
+                            <div class="flex items-center justify-between gap-3">
+                                <div>
+                                    <p class="eyebrow mb-0.5">F1 &middot; Position Sizing</p>
+                                    <p class="text-[11px] t-subtle leading-snug">Margin per trade = % saldo atau nominal tetap.</p>
+                                </div>
+                                <label class="switch">
+                                    <input type="checkbox" x-model="posSizingEnabled" class="sr-only">
+                                    <span class="switch-track"></span>
+                                </label>
+                            </div>
+                            <template x-if="posSizingEnabled">
+                                <div class="mt-3 space-y-3">
+                                    <div class="grid grid-cols-2 gap-2">
+                                        <button type="button" @click="posSizingMode = 'pct'" :class="posSizingMode === 'pct' ? 'seg seg-on' : 'seg'" class="seg">% Saldo</button>
+                                        <button type="button" @click="posSizingMode = 'fixed'" :class="posSizingMode === 'fixed' ? 'seg seg-on' : 'seg'" class="seg">Nominal (USDT)</button>
+                                    </div>
+                                    <div>
+                                        <label class="eyebrow block mb-2" x-text="posSizingMode === 'pct' ? 'Persentase Saldo (%)' : 'Nominal per Trade (USDT)'"></label>
+                                        <input type="number" step="0.5" min="0.1" x-model.number="posSizingValue" class="field mono font-bold text-lg">
+                                    </div>
+                                    <template x-if="posSizingMode === 'pct'">
+                                        <div>
+                                            <p class="text-[11px] t-subtle mb-1">Margin per trade saat ini:</p>
+                                            <p class="mono text-sm font-extrabold" :class="posSizingPctErr() ? 't-neg' : 't-pos'"
+                                               x-text="'$' + effPositionMargin().toFixed(2) + '  (≤ 100% wajib)'"></p>
+                                            <p x-show="posSizingPctErr()" class="text-[11px] t-neg font-bold mt-1">Input % harus ≤ 100.</p>
+                                        </div>
+                                    </template>
+                                    <template x-if="posSizingMode === 'fixed'">
+                                        <div>
+                                            <p class="text-[11px] t-subtle mb-1">Margin per trade saat ini:</p>
+                                            <p class="mono text-sm font-extrabold" :class="fixedSizingErr() ? 't-neg' : 't-pos'"
+                                               x-text="'$' + posSizingValue.toFixed(2) + '  (saldo: $' + balance.toFixed(2) + ')'"></p>
+                                            <p x-show="fixedSizingErr()" class="text-[11px] t-neg font-bold mt-1">Nominal tidak boleh melebihi saldo akun.</p>
+                                        </div>
+                                    </template>
+                                </div>
+                            </template>
+                        </div>
+
+                        <!-- ======== F2: DAILY LOSS LIMIT ======== -->
+                        <div class="tile">
+                            <div class="flex items-center justify-between gap-3">
+                                <div>
+                                    <p class="eyebrow mb-0.5">F2 &middot; Daily Loss Limit</p>
+                                    <p class="text-[11px] t-subtle leading-snug">Shutdown otomatis + tutup semua posisi setiap 00:00 UTC.</p>
+                                </div>
+                                <label class="switch">
+                                    <input type="checkbox" x-model="lossLimitEnabled" class="sr-only">
+                                    <span class="switch-track"></span>
+                                </label>
+                            </div>
+                            <div x-show="lossLimitEnabled" class="mt-3 space-y-3">
+                                <div class="grid grid-cols-2 gap-2">
+                                    <button type="button" @click="lossLimitMode = 'pct'" :class="lossLimitMode === 'pct' ? 'seg seg-on' : 'seg'" class="seg">% (basis F1/saldo)</button>
+                                    <button type="button" @click="lossLimitMode = 'fixed'" :class="lossLimitMode === 'fixed' ? 'seg seg-on' : 'seg'" class="seg">Nominal USDT</button>
+                                </div>
+                                <div>
+                                    <label class="eyebrow block mb-2" x-text="lossLimitMode === 'pct' ? 'Batas Loss (%)' : 'Batas Loss (USDT)'"></label>
+                                    <input type="number" step="0.5" min="0.1" x-model.number="lossLimitValue" class="field field-neg mono font-bold text-lg">
+                                </div>
+                                <div class="notice" :class="dailyLossLimitVal() > 0 ? 'notice-ok' : 'notice-bad'">
+                                    <div class="flex-1">
+                                        <div class="flex items-center justify-between gap-2">
+                                            <span class="font-bold uppercase tracking-wide text-[10px]">Status Harian</span>
+                                        </div>
+                                        <div class="mt-1 space-y-0.5">
+                                            <p class="text-[11px] leading-relaxed">PnL hari ini: <b class="mono" :class="dailyPnL >= 0 ? 't-pos' : 't-neg'" x-text="(dailyPnL >= 0 ? '+' : '') + dailyPnL.toFixed(2) + ' USDT'"></b></p>
+                                            <p class="text-[11px] leading-relaxed">Batas loss: <b class="mono" x-text="'-' + dailyLossLimitVal().toFixed(2) + ' USDT'"></b></p>
+                                            <p x-show="lossLimitHit" class="font-bold mt-1 text-[11px]"><span class="t-neg">ENGINE TERKUNCI</span> sampai 00:00 UTC — naikkan/nonaktifkan batas untuk restart.</p>
+                                        </div>
+                                    </div>
+                                </div>
+                                <p class="text-[11px] t-subtle leading-relaxed"><b>Mode %:</b> basis = nilai Position Sizing bila F1 aktif, selain itu saldo akun. Basis menyesuaikan otomatis saat F1 diubah.</p>
+                            </div>
+                        </div>
+
+                        <!-- ======== F3: TIME FILTER ======== -->
+                        <div class="tile">
+                            <div class="flex items-center justify-between gap-3">
+                                <div>
+                                    <p class="eyebrow mb-0.5">F3 &middot; Time Filter (Sesi)</p>
+                                    <p class="text-[11px] t-subtle leading-snug">Entry baru hanya di dalam jendela sesi (UTC).</p>
+                                </div>
+                                <span class="chip" :class="timeFilterActiveNow() ? 'chip-idle' : 'chip-lock'" x-text="timeFilterActiveNow() ? 'SESI AKTIF' : 'DI LUAR SESI'"></span>
+                            </div>
+                            <div class="mt-3">
+                                <select x-model="timeFilterMode" class="select">
+                                    <option value="24/7" class="opt">24/7 — Selalu aktif</option>
+                                    <option value="asian" class="opt">Asian Session (00:00–08:00 UTC)</option>
+                                    <option value="london" class="opt">London Session (08:00–16:00 UTC)</option>
+                                    <option value="newyork" class="opt">New York Session (13:00–21:00 UTC)</option>
+                                    <option value="overlap" class="opt">NY–London Overlap (13:00–16:00 UTC)</option>
+                                    <option value="custom" class="opt">Custom (input jam UTC)</option>
+                                </select>
+                                <template x-if="timeFilterMode === 'custom'">
+                                    <div class="grid grid-cols-2 gap-3 mt-3">
+                                        <div>
+                                            <label class="eyebrow block mb-2">Mulai (UTC, jam 0–23)</label>
+                                            <input type="number" step="1" min="0" max="23" x-model.number="customStartHour" class="field mono font-bold text-lg">
+                                        </div>
+                                        <div>
+                                            <label class="eyebrow block mb-2">Selesai (UTC, jam 0–23)</label>
+                                            <input type="number" step="1" min="0" max="23" x-model.number="customEndHour" class="field mono font-bold text-lg">
+                                        </div>
+                                    </div>
+                                </template>
+                                <p class="text-[11px] t-subtle leading-relaxed mt-2">Posisi yang sudah terbuka <b>tetap dikelola</b> (TP/SL &amp; trailing) di luar sesi. Mendukung jendela lintas tengah malam (mis. 22:00–02:00).</p>
+                            </div>
+                        </div>
+
+                        <!-- ======== F4: TRAILING STOP ======== -->
+                        <div class="tile">
+                            <div class="flex items-center justify-between gap-3">
+                                <div>
+                                    <p class="eyebrow mb-0.5">F4 &middot; Trailing Stop</p>
+                                    <p class="text-[11px] t-subtle leading-snug">Kunci profit: SL pindah ke entry lalu mengikuti harga.</p>
+                                </div>
+                                <label class="switch">
+                                    <input type="checkbox" x-model="trailingEnabled" class="sr-only">
+                                    <span class="switch-track"></span>
+                                </label>
+                            </div>
+                            <template x-if="trailingEnabled">
+                                <div class="mt-3 space-y-3">
+                                    <div>
+                                        <label class="eyebrow block mb-2">Trigger Profit (%)</label>
+                                        <input type="number" step="0.1" min="0.05" x-model.number="trailingTriggerPct" class="field field-pos mono font-bold text-lg">
+                                        <p class="text-[11px] t-subtle mt-1.5">Saat profit ≥ trigger, SL dipindah ke harga entry (break-even).</p>
+                                    </div>
+                                    <div>
+                                        <label class="eyebrow block mb-2">Trailing Distance (%)</label>
+                                        <input type="number" step="0.05" min="0.17" max="20" x-model.number="trailingDistPct" class="field field-neg mono font-bold text-lg">
+                                        <p class="text-[11px] t-subtle mt-1.5">SL = harga ekstrem − jarak ini. Wajib &gt; 0.17% (biaya round-trip OKX ~0.16%) agar tidak tersentuh hanya karena fee. SL hanya bergerak menguntungkan, tidak pernah mundur.</p>
+                                    </div>
+                                </div>
+                            </template>
+                        </div>
+
+                        <div class="rule"></div>
+
+                        <div class="flex flex-col sm:flex-row gap-3 pt-1">
 
                         <div>
                             <div class="flex justify-between items-center mb-2.5">
@@ -2977,6 +3928,11 @@ const uiTemplate = `
                         <span class="chip shrink-0"
                               :class="coinStates[coin]?.position === 'LONG' ? 'chip-long' : (coinStates[coin]?.position === 'SHORT' ? 'chip-short' : 'chip-idle')"
                               x-text="coinStates[coin]?.position || 'IDLE'"></span>
+                        <!-- Trailing stop aktif (F4) -->
+                        <span x-show="coinStates[coin]?.trailActive" class="chip chip-trail shrink-0">
+                            <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6"></path></svg>
+                            TRAIL
+                        </span>
                     </header>
 
                     <div class="mb-5 relative">
@@ -3011,6 +3967,10 @@ const uiTemplate = `
                                     <dt>TP/SL di OKX</dt>
                                     <dd class="badge" :class="coinStates[coin]?.hasTpSl ? 'badge-ok' : 'badge-wait'" x-text="coinStates[coin]?.hasTpSl ? '100% POSISI' : 'MENUNGGU'"></dd>
                                 </div>
+                                <div x-show="coinStates[coin]?.trailActive" class="flex justify-between items-center gap-2">
+                                    <dt>Trailing</dt>
+                                    <dd class="mono font-bold t-warn" x-text="'AKTIF • ekstrem ' + (coinStates[coin]?.trailExtreme?.toFixed(6) || '-')"></dd>
+                                </div>
                             </div>
                         </template>
                     </dl>
@@ -3019,7 +3979,7 @@ const uiTemplate = `
                         <div class="notice notice-bad mt-3 relative">
                             <svg class="w-4 h-4 shrink-0 mt-px" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
                             <div>
-                                <span x-show="!coinStates[coin]?.wsError">Margin $<span x-text="margin"></span> @ <span x-text="leverage"></span>x tidak cukup. Minimal $<span x-text="coinStates[coin]?.minMarginReq?.toFixed(2)"></span> (1 lot)</span>
+                                <span x-show="!coinStates[coin]?.wsError">Margin $<span x-text="posSizingEnabled ? effPositionMargin().toFixed(2) : margin"></span> @ <span x-text="leverage"></span>x tidak cukup. Minimal $<span x-text="coinStates[coin]?.minMarginReq?.toFixed(2)"></span> (1 lot)</span>
                                 <span x-show="coinStates[coin]?.wsError" class="t-warn" x-text="coinStates[coin]?.wsError"></span>
                             </div>
                         </div>
@@ -3047,6 +4007,16 @@ const uiTemplate = `
                 isRunning: false, coinStates: {}, logs: [],
                 totalPnL: 0, startTime: null, configOpen: false, isEditing: false,
                 theme: 'light', openPositionCount: 0,
+                // F1: Position Sizing (margin per trade dari % saldo / nominal tetap)
+                posSizingEnabled: false, posSizingMode: 'pct', posSizingValue: 5,
+                // F2: Daily Loss Limit (shutdown otomatis, reset 00:00 UTC)
+                lossLimitEnabled: false, lossLimitMode: 'pct', lossLimitValue: 5,
+                // F3: Time Filter (sesi UTC, hanya untuk entry baru)
+                timeFilterMode: '24/7', customStartHour: 8, customEndHour: 16,
+                // F4: Trailing Stop (trigger profit -> BEP, SL mengikuti harga ekstrem)
+                trailingEnabled: false, trailingTriggerPct: 0.5, trailingDistPct: 0.3,
+                // Data akun dari OKX (dipakai F1/F2 & tampilan)
+                balance: 0, dailyPnL: 0, lossLimitHit: false, lossDay: '',
                 // Rasio risiko:hadiah. < 1 berarti konfigurasi terbalik.
                 riskReward() {
                     const sl = parseFloat(this.stopLossPct), tp = parseFloat(this.takeProfitPct);
@@ -3073,6 +4043,51 @@ const uiTemplate = `
                 coinSlPct(coin) {
                     const st = this.coinStates[coin];
                     return (st && st.slDistPct > 0) ? st.slDistPct.toFixed(2) : this.stopLossPct;
+                },
+                // ===== F1: Position Sizing =====
+                // Margin per trade efektif (default / % saldo / nominal tetap).
+                effPositionMargin() {
+                    if (!this.posSizingEnabled) return parseFloat(this.margin) || 0;
+                    if (this.posSizingMode === 'fixed') return parseFloat(this.posSizingValue) || 0;
+                    return (parseFloat(this.balance) || 0) * (parseFloat(this.posSizingValue) || 0) / 100;
+                },
+                posSizingPctErr() {
+                    const v = parseFloat(this.posSizingValue);
+                    return this.posSizingEnabled && this.posSizingMode === 'pct' && (!v || v > 100);
+                },
+                fixedSizingErr() {
+                    const v = parseFloat(this.posSizingValue);
+                    const bal = parseFloat(this.balance) || 0;
+                    return this.posSizingEnabled && this.posSizingMode === 'fixed' && (!v || v <= 0 || (bal > 0 && v > bal));
+                },
+                // ===== F2: Daily Loss Limit =====
+                // Batas loss harian; basis mode % = nilai F1 bila aktif, selain itu saldo.
+                dailyLossLimitVal() {
+                    if (!this.lossLimitEnabled) return 0;
+                    const v = parseFloat(this.lossLimitValue) || 0;
+                    if (this.lossLimitMode === 'fixed') return v;
+                    let base = parseFloat(this.margin) || 0;
+                    if (this.posSizingEnabled) base = this.effPositionMargin();
+                    else if ((parseFloat(this.balance) || 0) > 0) base = parseFloat(this.balance);
+                    return base * v / 100;
+                },
+                // ===== F3: Time Filter =====
+                // true bila waktu UTC sekarang berada di dalam jendela sesi.
+                timeFilterActiveNow() {
+                    const mode = this.timeFilterMode || '24/7';
+                    if (mode === '24/7') return true;
+                    let start, end;
+                    if (mode === 'asian') { start = 0; end = 8; }
+                    else if (mode === 'london') { start = 8; end = 16; }
+                    else if (mode === 'newyork') { start = 13; end = 21; }
+                    else if (mode === 'overlap') { start = 13; end = 16; }
+                    else if (mode === 'custom') { start = parseInt(this.customStartHour) || 0; end = parseInt(this.customEndHour) || 0; }
+                    else return true;
+                    if (start === 0 && end === 24) return true;
+                    const now = new Date();
+                    const h = now.getUTCHours() + now.getUTCMinutes() / 60;
+                    if (start < end) return h >= start && h < end;
+                    return h >= start || h < end; // jendela lintas tengah malam
                 },
                 // Gabungkan koin dari konfigurasi dengan koin yang punya posisi
                 // terbuka di OKX tapi tidak ada di watchlist, agar tidak pernah
@@ -3110,12 +4125,28 @@ const uiTemplate = `
                                 this.tpSlMode = data.Config.tpSlMode || 'atr';
                                 this.atrPeriod = data.Config.atrPeriod || 14;
                                 this.atrSlMult = data.Config.atrSlMult || 1.0;
+                                this.posSizingEnabled = !!data.Config.posSizingEnabled;
+                                this.posSizingMode = data.Config.posSizingMode || 'pct';
+                                this.posSizingValue = data.Config.posSizingValue;
+                                this.lossLimitEnabled = !!data.Config.lossLimitEnabled;
+                                this.lossLimitMode = data.Config.lossLimitMode || 'pct';
+                                this.lossLimitValue = data.Config.lossLimitValue;
+                                this.timeFilterMode = data.Config.timeFilterMode || '24/7';
+                                this.customStartHour = data.Config.customStartHour;
+                                this.customEndHour = data.Config.customEndHour;
+                                this.trailingEnabled = !!data.Config.trailingEnabled;
+                                this.trailingTriggerPct = data.Config.trailingTriggerPct;
+                                this.trailingDistPct = data.Config.trailingDistPct;
                             }
                             this.mode = data.Config.mode;
                             this.isRunning = data.Config.isRunning;
                             this.coinStates = data.Coins || {};
                             this.logs = data.Logs || [];
                             this.totalPnL = data.TotalPnL || 0;
+                            this.balance = data.balance || 0;
+                            this.dailyPnL = data.dailyPnL || 0;
+                            this.lossLimitHit = !!data.lossLimitHit;
+                            this.lossDay = data.lossDay || '';
                             this.startTime = data.StartTime || null;
                             this.openPositionCount = this.displayCoins.filter(c => {
                                 const st = this.coinStates[c];
@@ -3156,6 +4187,47 @@ const uiTemplate = `
                             return;
                         }
                     }
+                    // Validasi F1: Position Sizing
+                    if (this.posSizingEnabled) {
+                        if (this.posSizingMode === 'pct' && this.posSizingPctErr()) {
+                            this.isEditing = false;
+                            this.showNotification('Position Sizing % harus antara 0 dan 100', 'error');
+                            return;
+                        }
+                        if (this.posSizingMode === 'fixed' && this.fixedSizingErr()) {
+                            this.isEditing = false;
+                            this.showNotification('Nominal Position Sizing tidak boleh melebihi saldo akun', 'error');
+                            return;
+                        }
+                    }
+                    // Validasi F2: Daily Loss Limit
+                    if (this.lossLimitEnabled && (!parseFloat(this.lossLimitValue) || parseFloat(this.lossLimitValue) <= 0)) {
+                        this.isEditing = false;
+                        this.showNotification('Batas loss harian harus lebih dari 0', 'error');
+                        return;
+                    }
+                    // Validasi F3: Custom session (UTC)
+                    if (this.timeFilterMode === 'custom') {
+                        const s = parseInt(this.customStartHour), e = parseInt(this.customEndHour);
+                        if (isNaN(s) || isNaN(e) || s < 0 || s > 23 || e < 0 || e > 23) {
+                            this.isEditing = false;
+                            this.showNotification('Jam sesi custom harus antara 0 dan 23 (UTC)', 'error');
+                            return;
+                        }
+                    }
+                    // Validasi F4: Trailing Stop
+                    if (this.trailingEnabled) {
+                        if (!parseFloat(this.trailingTriggerPct) || parseFloat(this.trailingTriggerPct) <= 0) {
+                            this.isEditing = false;
+                            this.showNotification('Trigger profit trailing harus lebih dari 0', 'error');
+                            return;
+                        }
+                        if (parseFloat(this.trailingDistPct) < 0.17) {
+                            this.isEditing = false;
+                            this.showNotification('Trailing distance harus lebih dari 0.17% (biaya round-trip OKX ~0.16%)', 'error');
+                            return;
+                        }
+                    }
                     try {
                         const res = await fetch('/api/config', {
                             method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -3169,7 +4241,19 @@ const uiTemplate = `
                                 atrPeriod: parseInt(this.atrPeriod) || 14,
                                 atrSlMult: parseFloat(this.atrSlMult) || 1.0,
                                 takeProfitPct: parseFloat(this.takeProfitPct),
-                                stopLossPct: parseFloat(this.stopLossPct)
+                                stopLossPct: parseFloat(this.stopLossPct),
+                                posSizingEnabled: !!this.posSizingEnabled,
+                                posSizingMode: this.posSizingMode,
+                                posSizingValue: parseFloat(this.posSizingValue) || 0,
+                                lossLimitEnabled: !!this.lossLimitEnabled,
+                                lossLimitMode: this.lossLimitMode,
+                                lossLimitValue: parseFloat(this.lossLimitValue) || 0,
+                                timeFilterMode: this.timeFilterMode,
+                                customStartHour: parseInt(this.customStartHour) || 0,
+                                customEndHour: parseInt(this.customEndHour) || 0,
+                                trailingEnabled: !!this.trailingEnabled,
+                                trailingTriggerPct: parseFloat(this.trailingTriggerPct) || 0,
+                                trailingDistPct: parseFloat(this.trailingDistPct) || 0
                             })
                         });
                         const data = await res.json().catch(() => ({}));
