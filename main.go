@@ -3119,6 +3119,10 @@ const uiTemplate = `
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>OKX Algo-Trader Pro</title>
+    <!-- Ikon web (SVG inline, tanpa file eksternal) + warna chrome browser mobile -->
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Cdefs%3E%3ClinearGradient%20id='g'%20x1='0'%20y1='0'%20x2='1'%20y2='1'%3E%3Cstop%20offset='0'%20stop-color='%230d9488'/%3E%3Cstop%20offset='1'%20stop-color='%2310b981'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect%20width='32'%20height='32'%20rx='8'%20fill='url(%23g)'/%3E%3Cpath%20d='M6%2021l6-7%205%204%208-9'%20fill='none'%20stroke='%23ffffff'%20stroke-width='2.4'%20stroke-linecap='round'%20stroke-linejoin='round'/%3E%3C/svg%3E">
+    <link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Cdefs%3E%3ClinearGradient%20id='g'%20x1='0'%20y1='0'%20x2='1'%20y2='1'%3E%3Cstop%20offset='0'%20stop-color='%230d9488'/%3E%3Cstop%20offset='1'%20stop-color='%2310b981'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect%20width='32'%20height='32'%20rx='8'%20fill='url(%23g)'/%3E%3Cpath%20d='M6%2021l6-7%205%204%208-9'%20fill='none'%20stroke='%23ffffff'%20stroke-width='2.4'%20stroke-linecap='round'%20stroke-linejoin='round'/%3E%3C/svg%3E">
+    <meta name="theme-color" content="#0d9488">
     <script>
         // WAJIB di baris pertama <head>: tema diterapkan sebelum CSS, font,
         // dan Alpine dimuat supaya tidak ada kedipan (FOUC) saat reload.
