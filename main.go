@@ -240,9 +240,10 @@ type CoinState struct {
 	TpSlMode  string  `json:"tpSlMode"` // mode yang terpakai saat TP/SL dipasang
 	AtrUsed   float64 `json:"atrUsed"`  // nilai ATR yang dipakai (0 = mode persen)
 
-	// State trailing stop (F4). TrailActive=true artinya trigger profit sudah
-	// tercapai dan SL dikelola dinamis. TrailExtreme = harga ekstrem sejak
-	// entry (tertinggi utk LONG, terendah utk SHORT).
+	// Status trailing stop (F4). Trailing ditangani OKX lewat satu order
+	// move_order_stop, jadi bot hanya MEMBACA statusnya: TrailActive = order
+	// trailing hidup, TrailExtreme = moveTriggerPx yang sedang dihitung OKX
+	// (0 selama belum melewati harga aktivasi / belum ada order).
 	TrailActive  bool    `json:"trailActive"`
 	TrailExtreme float64 `json:"trailExtreme"`
 }
@@ -581,8 +582,22 @@ func atrValue(symbol string, period int) (float64, bool) {
 // butuh ~70 menit untuk punya 14 candle. Dipanggil sekali per simbol saat
 // startup / koin baru ditambahkan, dan menyesuaikan diri dengan data WS
 // (tidak menimpa bila buffer sudah lebih lengkap dari yang bisa didapat).
+// getConfigTimeframe mengembalikan timeframe aktif dari konfigurasi (M5/M15).
+func getConfigTimeframe() string {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	if t := state.Config.Timeframe; t != "" {
+		return t
+	}
+	return "5m"
+}
+
+// seedCandleHistory mengisi buffer candle dari REST OKX (hingga 250 candle).
+// Jumlah itu cukup untuk membuat EMA(200), RSI(14), dan BB(20) matang sejak
+// awal berjalan — sebelumnya hanya 100 candle.
 func seedCandleHistory(symbol string) {
-	url := fmt.Sprintf("https://www.okx.com/api/v5/market/candles?instId=%s&bar=5m&limit=100", symbol)
+	tf := getConfigTimeframe()
+	url := fmt.Sprintf("https://www.okx.com/api/v5/market/candles?instId=%s&bar=%s&limit=250", symbol, tf)
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return
@@ -603,26 +618,31 @@ func seedCandleHistory(symbol string) {
 	}
 
 	// Data datang dari candle TERBARU ke terlama — balikkan agar kronologis.
-	closes := make([]float64, 0, 100)
-	ohlcs := make([]CandleOHLC, 0, 100)
+	closes := make([]float64, 0, 250)
+	ohlcs := make([]CandleOHLC, 0, 250)
 	for i := len(parsed.Data) - 1; i >= 0; i-- {
 		arr, ok := parsed.Data[i].([]interface{})
 		if !ok || len(arr) < 5 {
 			continue
 		}
 		tsStr, _ := arr[0].(string)
+		oStr, _ := arr[1].(string)
 		hStr, _ := arr[2].(string)
 		lStr, _ := arr[3].(string)
 		cStr, _ := arr[4].(string)
 		ts, terr := strconv.ParseInt(tsStr, 10, 64)
+		openPx, oerr := strconv.ParseFloat(oStr, 64)
 		high, herr := strconv.ParseFloat(hStr, 64)
 		low, lerr := strconv.ParseFloat(lStr, 64)
 		closePx, cerr := strconv.ParseFloat(cStr, 64)
+		if oerr != nil || openPx <= 0 {
+			openPx = closePx // fallback bila open tidak bisa dibaca
+		}
 		if terr != nil || herr != nil || lerr != nil || cerr != nil || closePx <= 0 || high < low || low <= 0 {
 			continue
 		}
 		closes = append(closes, closePx)
-		ohlcs = append(ohlcs, CandleOHLC{Ts: ts, High: high, Low: low, Close: closePx})
+		ohlcs = append(ohlcs, CandleOHLC{Ts: ts, Open: openPx, High: high, Low: low, Close: closePx})
 	}
 	if len(closes) == 0 {
 		return
@@ -634,7 +654,7 @@ func seedCandleHistory(symbol string) {
 		candleOHLC[symbol] = ohlcs
 	}
 	state.mu.Unlock()
-	addLog(fmt.Sprintf("[CANDLE HISTORY] %s: %d candle 5m dimuat (ATR siap)", symbol, len(closes)))
+	addLog(fmt.Sprintf("[CANDLE HISTORY] %s: %d candle %s dimuat (EMA200/RSI/BB siap)", symbol, len(closes), tf))
 }
 
 // TpSlConfig adalah snapshot konfigurasi TP/SL yang dipakai dalam SATU
@@ -817,6 +837,73 @@ func placeOrder(symbol, side string, size float64, entryPrice, tpPrice, slPrice 
 		"tdMode":  "isolated",
 		"side":    side,
 		"ordType": "market",
+		"sz":      szStr,
+		"attachAlgoOrds": []map[string]interface{}{
+			{ // TP untuk 100% posisi
+				"tpTriggerPx":     formatPx(tpPrice, spec),
+				"tpOrdPx":         "-1",
+				"tpTriggerPxType": "last",
+			},
+			{ // SL untuk 100% posisi
+				"slTriggerPx":     formatPx(slPrice, spec),
+				"slOrdPx":         "-1",
+				"slTriggerPxType": "last",
+			},
+		},
+	}
+	bodyBytes, _ := json.Marshal(payload)
+
+	result, err := okxRequest("POST", "/api/v5/trade/order", string(bodyBytes))
+	if err != nil {
+		return res, err
+	}
+	if data, ok := result["data"].([]interface{}); ok && len(data) > 0 {
+		if first, ok := data[0].(map[string]interface{}); ok {
+			res.OrderID, _ = first["ordId"].(string)
+			res.SZ, _ = first["sz"].(string)
+		}
+	}
+	return res, nil
+}
+
+// pendingEntryTTL — berapa lama order entry LIMIT boleh menunggu terisi sebelum
+// dianggap basi dan dibatalkan (sedikit di bawah 1 candle M5).
+const pendingEntryTTL = 3 * time.Minute
+
+// placeLimitOrder mengirim order entry LIMIT + TP & SL untuk 100% posisi.
+//
+// Sama seperti placeOrder: TP dan SL dikirim sebagai DUA elemen attachAlgoOrds
+// terpisah dengan ukuran penuh (100%) agar OKX tidak membagi posisi, dan dipakai
+// harga market saat trigger (tpOrdPx/slOrdPx = "-1"). Limit order dipilih agar
+// fee lebih rendah (maker bila order mengendap sebentar di order book).
+func placeLimitOrder(symbol, side string, size, limitPx, tpPrice, slPrice float64) (OrderResult, error) {
+	var res OrderResult
+
+	spec, ok := getInstrumentSpec(symbol)
+	if !ok {
+		return res, fmt.Errorf("spesifikasi instrumen %s belum dimuat dari OKX", symbol)
+	}
+	if size < spec.MinSz {
+		return res, fmt.Errorf("size %.4f kontrak di bawah minSz %.4f", size, spec.MinSz)
+	}
+	if limitPx <= 0 || tpPrice <= 0 || slPrice <= 0 || math.IsNaN(limitPx) || math.IsNaN(tpPrice) || math.IsNaN(slPrice) {
+		return res, fmt.Errorf("harga tidak valid (px=%v tp=%v sl=%v)", limitPx, tpPrice, slPrice)
+	}
+	if side == "buy" && (tpPrice <= limitPx || slPrice >= limitPx) {
+		return res, fmt.Errorf("arah TP/SL tidak cocok untuk LONG (entry=%v tp=%v sl=%v)", limitPx, tpPrice, slPrice)
+	}
+	if side != "buy" && (tpPrice >= limitPx || slPrice <= limitPx) {
+		return res, fmt.Errorf("arah TP/SL tidak cocok untuk SHORT (entry=%v tp=%v sl=%v)", limitPx, tpPrice, slPrice)
+	}
+
+	szStr := strconv.FormatFloat(size, 'f', decimalsFor(spec.LotSz), 64)
+
+	payload := map[string]interface{}{
+		"instId":  symbol,
+		"tdMode":  "isolated",
+		"side":    side,
+		"ordType": "limit",
+		"px":      formatPx(limitPx, spec),
 		"sz":      szStr,
 		"attachAlgoOrds": []map[string]interface{}{
 			{ // TP untuk 100% posisi
@@ -1592,165 +1679,465 @@ func roundTickUp(px, tick float64) float64 {
 	return math.Ceil(px/tick-1e-9) * tick
 }
 
-// manageTrailing mengelola trailing stop (F4) untuk satu posisi terbuka.
-// Dipanggil dari sinkronisasi posisi (tiap 10 detik) memakai harga mark OKX.
+// ==========================================
+// 2.4b TRAILING STOP NATIF OKX (F4)
+// ==========================================
 //
-// Aturan PRD:
-//  1. profit >= TriggerProfit% -> SL dipindah ke entry (break-even point).
-//  2. harga terus bergerak      -> SL = harga ekstrem ± TrailingDistance.
-//  3. SL hanya boleh bergerak MENGUNTUNGKAN (naik utk LONG, turun utk SHORT),
-//     tidak pernah mundur.
-//  4. profit belum mencapai trigger -> SL tetap (fixed dari ATR/persen, tidak
-//     diubah), hanya harga ekstrem yang dicatat.
+// Trailing stop TIDAK lagi dihitung di server ini. Satu order
+// `ordType=move_order_stop` dipasang SEKALI untuk setiap posisi, lalu OKX
+// yang menghitung dan menggeser trigger price-nya sendiri. Bot hanya
+// MEMBACA daftar order trailing untuk menampilkan status di dashboard —
+// tidak ada cancel+pasang ulang tiap 10 detik, tidak ada sleep, tidak ada
+// bombardir order.
 //
-// Pembaruan lewat replaceTpSl (batal + pasang ulang TP & SL) dengan TP lama
-// dipertahankan, dan memakai cooldown yang sama dengan watchdog supaya bot
-// tidak membombardir OKX ketika harga naik terus menerus.
-func manageTrailing(symbol, side string, positionSize, entryPrice, markPx float64, cfg Config) {
-	if !cfg.TrailingEnabled || positionSize <= 0 || entryPrice <= 0 || markPx <= 0 {
+// Pemetaan konfigurasi -> parameter OKX:
+//   TrailingDistPct    -> callbackRatio  (0.005 = 0.5%)
+//   TrailingTriggerPct -> activePx       (harga aktivasi; sebelum tercapai OKX diem)
+//
+// Semantik OKX (dokumentasi v5, ordType=move_order_stop):
+//   side sell (exit LONG)  : trigger = harga tertinggi sejak dipasang x (1 - ratio)
+//   side buy  (exit SHORT) : trigger = harga terendah sejak dipasang   x (1 + ratio)
+// Persis trailing stop LONG/SHOR yang diharapkan, plus jaminan "SL tidak
+// pernah mundur" yang otomatis dikerjakan di sisi exchange.
+//
+// Order trailing memakai reduceOnly sehingga tidak pernah membuka posisi
+// terbalik, dan aman berdampingan dengan TP/SL conditional yang sudah
+// terpasang: hanya satu yang akan terisi, lalu posisi langsung 0.
+
+// trailFixCooldown membatasi percobaan pasang/batal trailing order maksimal
+// satu kali per instrumen per menit, supaya penolakan OKX tidak memicu
+// pengulangan tanpa henti.
+const trailFixCooldown = 60 * time.Second
+
+// trailSweepInterval jeda antar-pembersihan order trailing yatim saat toggle
+// trailing dimatikan. Cukup sering untuk membersihkan sisa order, cukup jarang
+// supaya tidak menambah beban API.
+const trailSweepInterval = 5 * time.Minute
+
+var (
+	trailMu      sync.Mutex
+	trailLocks   = map[string]*sync.Mutex{}
+	trailFixedAt = map[string]time.Time{}
+	trailSweptAt time.Time
+)
+
+// acquireTrailLock mencegah dua sinkronisasi bersamaan memasang trailing order
+// untuk instrumen yang sama. Sengaja lock TERPISAH dari TP/SL supaya pemasangan
+// trailing tidak tertunda oleh perbaikan watchdog TP/SL (keduanya tidak
+// bertabrakan: order trailing punya ordType sendiri).
+func acquireTrailLock(symbol string) bool {
+	trailMu.Lock()
+	defer trailMu.Unlock()
+	mu, ok := trailLocks[symbol]
+	if !ok {
+		mu = &sync.Mutex{}
+		trailLocks[symbol] = mu
+	}
+	return mu.TryLock()
+}
+
+func releaseTrailLock(symbol string) {
+	trailMu.Lock()
+	mu := trailLocks[symbol]
+	trailMu.Unlock()
+	if mu != nil {
+		mu.Unlock()
+	}
+}
+
+func trailRecentlyFixed(symbol string) bool {
+	trailMu.Lock()
+	defer trailMu.Unlock()
+	last, ok := trailFixedAt[symbol]
+	return ok && time.Since(last) < trailFixCooldown
+}
+
+func markTrailFixed(symbol string) {
+	trailMu.Lock()
+	trailFixedAt[symbol] = time.Now()
+	trailMu.Unlock()
+}
+
+// trailingOrderInfo adalah ringkasan satu order trailing stop native OKX.
+type trailingOrderInfo struct {
+	AlgoId string
+	InstId string
+	Side   string
+	Sz     float64
+	Ratio  float64 // callbackRatio
+	// ActivePx = harga aktivasi dari konfigurasi kita (0 = langsung aktif).
+	ActivePx float64
+	// MoveTriggerPx = trigger price yang SEDANG dihitung OKX. 0 selama belum
+	// melewati ActivePx.
+	MoveTriggerPx float64
+	ReduceOnly    bool
+}
+
+// parseFloatField mengurai field numerik dari respons OKX, aman terhadap
+// string kosong ("") dan nilai non-numerik.
+func parseFloatField(v interface{}) float64 {
+	f, err := strconv.ParseFloat(strings.TrimSpace(toString(v)), 64)
+	if err != nil {
+		return 0
+	}
+	return f
+}
+
+// fetchTrailingOrders mengambil SEMUA order trailing stop yang masih live dalam
+// satu panggilan, lalu dikelompokkan per instrumen. Dipakai juga untuk membatalkan
+// order yang tidak lagi relevan (toggle dimatikan / posisi sudah tertutup).
+func fetchTrailingOrders() map[string][]trailingOrderInfo {
+	out := map[string][]trailingOrderInfo{}
+	result, err := okxRequest("GET", "/api/v5/trade/orders-algo-pending?ordType=move_order_stop&instType=SWAP", "")
+	if err != nil {
+		addLog(fmt.Sprintf("[WARN] Gagal cek trailing stop OKX: %v", err))
+		return out
+	}
+	data, _ := result["data"].([]interface{})
+	for _, item := range data {
+		algo, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if stateStr, _ := algo["state"].(string); stateStr != "live" {
+			continue
+		}
+		sym, _ := algo["instId"].(string)
+		algoId, _ := algo["algoId"].(string)
+		if sym == "" || algoId == "" {
+			continue
+		}
+		side, _ := algo["side"].(string)
+		reduceOnly, _ := algo["reduceOnly"].(string)
+		out[sym] = append(out[sym], trailingOrderInfo{
+			AlgoId:        algoId,
+			InstId:        sym,
+			Side:          side,
+			Sz:            parseFloatField(algo["sz"]),
+			Ratio:         parseFloatField(algo["callbackRatio"]),
+			ActivePx:      parseFloatField(algo["activePx"]),
+			MoveTriggerPx: parseFloatField(algo["moveTriggerPx"]),
+			ReduceOnly:    reduceOnly == "true",
+		})
+	}
+	return out
+}
+
+// cancelTrailingOrders membatalkan daftar order trailing stop lewat satu
+// permintaan per order (cancel-algos maksimal 10 order per permintaan).
+func cancelTrailingOrders(orders []trailingOrderInfo) bool {
+	if len(orders) == 0 {
+		return true
+	}
+	allOK := true
+	for _, o := range orders {
+		body, _ := json.Marshal(map[string]interface{}{"instId": o.InstId, "algoId": o.AlgoId})
+		if _, err := okxRequest("POST", "/api/v5/trade/cancel-algos", string(body)); err != nil {
+			allOK = false
+			addLog(fmt.Sprintf("[WARN] Gagal batalkan trailing stop %s (%s): %v", o.InstId, o.AlgoId, err))
+		}
+	}
+	return allOK
+}
+
+// trailClOrdId membuat ID klien untuk order trailing supaya order milik bot
+// ini mudah dikenali di kanal publik (order manual user tidak memakai prefix).
+// Syarat OKX: hanya alfanumerik, maksimal 32 karakter.
+func trailClOrdId(symbol string) string {
+	clean := strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			return r
+		}
+		return -1
+	}, symbol)
+	id := "botts" + clean
+	if len(id) > 32 {
+		id = id[:32]
+	}
+	return id
+}
+
+// exitSideFor mengembalikan arah order yang MENUTUP posisi: long -> sell,
+// short -> buy.
+func exitSideFor(side string) string {
+	if side == "short" {
+		return "buy"
+	}
+	return "sell"
+}
+
+// trailingActivePx mengubah "Trigger Profit %" menjadi activePx OKX, yaitu
+// harga saat mana OKX mulai MELACAK harga dan menghitung trigger trailing.
+//
+//	  LONG  -> entry x (1 + trigger%)  (aktif setelah harga naik)
+//
+//		SHORT -> entry x (1 - trigger%)  (aktif setelah harga turun)
+//
+// activePx hanya dikirim bila berada di sisi yang benar dari harga pasar saat
+// order dipasang; kalau sudah terlewati (jarak terlalu kecil / harga sudah
+// bergerak jauh), activePx dilewati agar trailing aktif langsung — perilaku
+// ini persis sama dengan "SL langsung pindah ke entry" pada logika lama.
+func trailingActivePx(side string, entryPrice, markPx, triggerPct float64, spec InstrumentSpec) (float64, bool) {
+	if entryPrice <= 0 || triggerPct <= 0 {
+		return 0, false
+	}
+	frac := pctToFrac(triggerPct)
+	px := entryPrice * (1 + frac)
+	if side == "short" {
+		px = entryPrice * (1 - frac)
+	}
+	if px <= 0 || math.IsNaN(px) || math.IsInf(px, 0) {
+		return 0, false
+	}
+	if side == "short" {
+		if markPx > 0 && px >= markPx {
+			return 0, false
+		}
+		return roundTickDown(px, spec.TickSz), true
+	}
+	if markPx > 0 && px <= markPx {
+		return 0, false
+	}
+	return roundTickUp(px, spec.TickSz), true
+}
+
+// placeTrailingStop memasang SATU order trailing stop native OKX untuk menutup
+// 100% posisi. Parameter callbackRatio = TrailingDistPct/100.
+func placeTrailingStop(symbol, side string, positionSize, entryPrice, markPx float64, spec InstrumentSpec, cfg Config) bool {
+	if positionSize < spec.MinSz {
+		return false
+	}
+	distFrac := pctToFrac(cfg.TrailingDistPct)
+	if distFrac <= 0 {
+		return false
+	}
+	body := map[string]interface{}{
+		"instId":        symbol,
+		"tdMode":        "isolated",
+		"side":          exitSideFor(side),
+		"posSide":       "net",
+		"ordType":       "move_order_stop",
+		"sz":            strconv.FormatFloat(positionSize, 'f', decimalsFor(spec.LotSz), 64),
+		"reduceOnly":    true,
+		"callbackRatio": strconv.FormatFloat(distFrac, 'f', 8, 64),
+		"algoClOrdId":   trailClOrdId(symbol),
+	}
+	activePx, hasActive := trailingActivePx(side, entryPrice, markPx, cfg.TrailingTriggerPct, spec)
+	if hasActive {
+		body["activePx"] = formatPx(activePx, spec)
+	}
+	payload, _ := json.Marshal(body)
+	if _, err := okxRequest("POST", "/api/v5/trade/order-algo", string(payload)); err != nil {
+		addLog(fmt.Sprintf("[WARN] Gagal pasang trailing stop %s: %v", symbol, err))
+		return false
+	}
+	if hasActive {
+		addLog(fmt.Sprintf("[TRAILING] %s %s: order trailing stop OKX dipasang (jarak %.2f%%, aktif saat harga %s)",
+			symbol, strings.ToUpper(side), cfg.TrailingDistPct, formatPx(activePx, spec)))
+	} else {
+		addLog(fmt.Sprintf("[TRAILING] %s %s: order trailing stop OKX dipasang (jarak %.2f%%, langsung aktif)",
+			symbol, strings.ToUpper(side), cfg.TrailingDistPct))
+	}
+	return true
+}
+
+// publishTrailState menyimpan status trailing untuk dashboard. triggerPx adalah
+// moveTriggerPx dari OKX: 0 selama order belum melewati activePx, 0 = masih
+// "MENUNGGU".
+func publishTrailState(symbol string, live bool, triggerPx float64) {
+	state.mu.Lock()
+	if c := state.Coins[symbol]; c != nil {
+		c.TrailActive = live
+		c.TrailExtreme = triggerPx
+	}
+	state.mu.Unlock()
+}
+
+// clearTrailState menghapus state trailing (dipakai saat toggle dimatikan atau
+// posisi sudah tertutup). Ini juga memperbaiki bug lama: state trailing
+// sebelumnya tidak pernah di-reset sehingga posisi berikutnya mewarisi
+// TrailExtreme harga lama.
+func clearTrailState(symbol string) {
+	publishTrailState(symbol, false, 0)
+}
+
+// hasTrailState melaporkan masih ada koin yang UI-nya menampilkan trailing,
+// dipakai untuk memutuskan apakah perlu menyisir order trailing yang menggantung.
+func hasTrailState() bool {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	for _, c := range state.Coins {
+		if c != nil && c.TrailActive {
+			return true
+		}
+	}
+	return false
+}
+
+// trailSweepDue melaporkan sudah waktunya menyapu order trailing yang
+// menggantung (saat toggle trailing dimatikan). Mengembalikan true juga
+// mencatat waktu sapuan, jadi tidak menyapu berulang di tiap siklus.
+func trailSweepDue() bool {
+	trailMu.Lock()
+	defer trailMu.Unlock()
+	if time.Since(trailSweptAt) < trailSweepInterval {
+		return false
+	}
+	trailSweptAt = time.Now()
+	return true
+}
+
+// sweepOrphanTrailing membatalkan order trailing yang tidak lagi sesuai posisi
+// yang dikelola bot. Dipanggil saat trailing dimatikan, untuk membersihkan
+// order dari sesi sebelumnya / restart.
+func sweepOrphanTrailing(live map[string][]trailingOrderInfo) {
+	if len(live) == 0 {
 		return
 	}
+	all := make([]trailingOrderInfo, 0, len(live))
+	for _, orders := range live {
+		all = append(all, orders...)
+	}
+	if cancelTrailingOrders(all) {
+		addLog(fmt.Sprintf("[TRAILING] Trailing stop nonaktif: %d order OKX yang menggantung dibatalkan", len(all)))
+		for _, o := range all {
+			clearTrailState(o.InstId)
+		}
+	}
+}
+
+// reconcileTrailingStop memastikan order trailing native OKX sesuai dengan
+// konfigurasi saat ini untuk satu posisi — TANPA pernah menghitung harga SL.
+//
+// Perilaku:
+//   - toggle OFF            -> batalkan order yang ada, tidak pasang yang baru.
+//   - order sudah cocok     -> tidak ada panggilan mutasi sama sekali.
+//   - konfigurasi berubah   -> batalkan + pasang ulang (sekali, cooldown 60 dtk).
+//
+// Parameter live berisi order trailing milik instrumen/symbol yang sudah
+// diambil pada siklus sinkronisasi ini, sehingga reconcile ini tidak menambah
+// panggilan API.
+func reconcileTrailingStop(symbol, side string, positionSize, entryPrice, markPx float64, cfg Config, live []trailingOrderInfo) {
+	// --- OFF: tidak ada trailing order, dan yang ada harus dibatalkan. ---
+	if !cfg.TrailingEnabled {
+		if len(live) > 0 && cancelTrailingOrders(live) {
+			addLog(fmt.Sprintf("[TRAILING] %s: trailing stop dimatikan, order OKX dibatalkan", symbol))
+		}
+		clearTrailState(symbol)
+		return
+	}
+
+	// --- Tidak ada posisi: ordurkan pembatalan agar order tidak yatim. ---
+	if positionSize <= 0 || entryPrice <= 0 {
+		if len(live) > 0 && cancelTrailingOrders(live) {
+			addLog(fmt.Sprintf("[TRAILING] %s: posisi sudah tertutup, trailing stop OKX dibatalkan", symbol))
+		}
+		clearTrailState(symbol)
+		return
+	}
+
 	spec, ok := getInstrumentSpec(symbol)
 	if !ok {
 		return
 	}
-
-	// Jangan bentrok dengan watchdog / reprice yang sedang memperbaiki simbol ini.
-	if !acquireTpSlLock(symbol) {
-		return
-	}
-	defer releaseTpSlLock(symbol)
-
-	info, err := fetchPendingTpSl(symbol)
-	if err != nil || !info.HaveSl {
-		return // tanpa SL terpasang, trailing tidak beroperasi
-	}
-	currentSL := info.SlPx
-
-	state.mu.RLock()
-	coin := state.Coins[symbol]
-	trailActive := false
-	extreme := markPx
-	keptTP := info.TpPx
-	keptTpDist := 0.0
-	keptMode := cfg.TpSlMode
-	keptAtr := 0.0
-	if coin != nil {
-		trailActive = coin.TrailActive
-		if coin.TrailExtreme > 0 {
-			extreme = coin.TrailExtreme
+	if cfg.TrailingDistPct < trailingMinDistPct || positionSize < spec.MinSz {
+		if len(live) > 0 {
+			cancelTrailingOrders(live)
 		}
-		if coin.TpPrice > 0 {
-			keptTP = coin.TpPrice
-		}
-		keptTpDist = coin.TpDistPct
-		if coin.TpSlMode != "" {
-			keptMode = coin.TpSlMode
-		}
-		keptAtr = coin.AtrUsed
-	}
-	state.mu.RUnlock()
-
-	// Profit % dari entry ke mark (positif = profit).
-	profitPct := 0.0
-	if side == "short" {
-		profitPct = (entryPrice - markPx) / entryPrice * 100
-	} else {
-		profitPct = (markPx - entryPrice) / entryPrice * 100
-	}
-
-	// Harga ekstrem sejak entry: tertinggi utk LONG, terendah utk SHORT.
-	newExtreme := extreme
-	if side == "short" {
-		if markPx < newExtreme {
-			newExtreme = markPx
-		}
-	} else {
-		if markPx > newExtreme {
-			newExtreme = markPx
-		}
-	}
-
-	if !trailActive && profitPct < cfg.TrailingTriggerPct {
-		// Trigger belum tercapai: catat ekstrem, biarkan SL fixed.
-		state.mu.Lock()
-		if c := state.Coins[symbol]; c != nil {
-			c.TrailExtreme = newExtreme
-		}
-		state.mu.Unlock()
+		clearTrailState(symbol)
 		return
 	}
 
-	// Hitung SL target. Saat baru aktif, SL pindah ke entry (BEP).
-	var wantSL float64
-	if side == "short" {
-		if !trailActive {
-			wantSL = entryPrice
-		} else {
-			wantSL = newExtreme * (1 + pctToFrac(cfg.TrailingDistPct))
-		}
-	} else {
-		if !trailActive {
-			wantSL = entryPrice
-		} else {
-			wantSL = newExtreme * (1 - pctToFrac(cfg.TrailingDistPct))
-		}
-	}
-	// Bulatkan ke tick MENJAUH dari harga saat ini (LONG ke bawah, SHORT ke
-	// atas) supaya jarak aktual >= TrailingDistPct dan tidak kena noise.
-	if side == "short" {
-		wantSL = roundTickUp(wantSL, spec.TickSz)
-	} else {
-		wantSL = roundTickDown(wantSL, spec.TickSz)
-	}
+	wantActive, hasActive := trailingActivePx(side, entryPrice, markPx, cfg.TrailingTriggerPct, spec)
+	wantRatio := pctToFrac(cfg.TrailingDistPct)
+	wantSide := exitSideFor(side)
 
-	// Aturan mutlak: SL hanya boleh bergerak MENGUNTUNGKAN.
-	if side == "short" {
-		if wantSL > currentSL {
-			wantSL = currentSL
-		}
-	} else {
-		if wantSL < currentSL {
-			wantSL = currentSL
-		}
+	if !acquireTrailLock(symbol) {
+		return
 	}
+	defer releaseTrailLock(symbol)
 
-	// Tidak ada perubahan berarti -> cukup perbarui state trailing.
-	tol := spec.TickSz / 2
-	if tol < 1e-12 {
-		tol = 1e-12
-	}
-	state.mu.Lock()
-	if c := state.Coins[symbol]; c != nil {
-		c.TrailActive = true
-		c.TrailExtreme = newExtreme
-	}
-	state.mu.Unlock()
-	if math.Abs(wantSL-currentSL) <= tol {
+	// --- Sudah ada order: cocokkan dengan konfigurasi. ---
+	if len(live) > 0 {
+		o := live[0]
+		ratioOK := math.Abs(o.Ratio-wantRatio) <= 0.0000005
+		activeOK := !hasActive && o.ActivePx <= 0
+		if hasActive && o.ActivePx > 0 {
+			activeOK = math.Abs(o.ActivePx-wantActive) <= spec.TickSz
+		}
+		sizeOK := math.Abs(o.Sz-positionSize) <= spec.LotSz
+		if o.Side == wantSide && o.ReduceOnly && ratioOK && activeOK && sizeOK {
+			// Konfigurasi sama -> JANGAN sentuh order apa pun. Ini yang membuat
+			// trailing native tidak membebani server: 0 panggilan mutasi.
+			publishTrailState(symbol, true, o.MoveTriggerPx)
+			// Bersihkan sisa duplikat bila pernah terjadi (mis. dari versi lama).
+			if len(live) > 1 {
+				if cancelTrailingOrders(live[1:]) {
+					addLog(fmt.Sprintf("[WARN] %s: %d trailing stop duplikat dibatalkan", symbol, len(live)-1))
+				}
+			}
+			return
+		}
+		// Konfigurasi berubah -> ganti order-nya.
+		if trailRecentlyFixed(symbol) {
+			return
+		}
+		if !cancelTrailingOrders(live) {
+			return
+		}
+		// Jeda singkat supaya OKX memproses pembatalan sebelum order baru dibuat.
+		time.Sleep(300 * time.Millisecond)
+		if placeTrailingStop(symbol, side, positionSize, entryPrice, markPx, spec, cfg) {
+			markTrailFixed(symbol)
+			publishTrailState(symbol, true, 0)
+		}
 		return
 	}
 
-	// Cooldown yang sama dengan watchdog: hindari pasang ulang berlebihan.
-	if tpslRecentlyFixed(symbol) {
+	// --- Belum ada order -> pasang satu. ---
+	if trailRecentlyFixed(symbol) {
 		return
 	}
+	if placeTrailingStop(symbol, side, positionSize, entryPrice, markPx, spec, cfg) {
+		markTrailFixed(symbol)
+		publishTrailState(symbol, true, 0)
+	}
+}
 
-	slDist := math.Abs(wantSL-entryPrice) / entryPrice * 100
-	calc := TpSlCalc{
-		TpPx:        keptTP,
-		SlPx:        wantSL,
-		Mode:        keptMode,
-		AtrVal:      keptAtr,
-		TpDistPct:   keptTpDist,
-		SlDistPct:   slDist,
-		UsedPercent: keptMode != tpSlModeATR,
-	}
-	if !replaceTpSl(symbol, side, positionSize, calc) {
+// applyTrailingToOpenPositions memasang trailing stop pada semua posisi yang
+// sedang terbuka (dipanggil setelah konfigurasi berubah dari UI) atau
+// membatalkannya bila toggle dimatikan.
+func applyTrailingToOpenPositions(cfg Config) {
+	if !cfg.TrailingEnabled {
+		// Toggle MATI: tidak ada order trailing yang boleh menggantung.
+		if trailSweepDue() {
+			sweepOrphanTrailing(fetchTrailingOrders())
+		}
 		return
 	}
-	markTpSlFixed(symbol)
-	addLog(fmt.Sprintf("[TRAILING] %s %s: SL naik ke %s (ekstrem %s, jarak %.2f%%) — trailing aktif",
-		symbol, strings.ToUpper(side), formatPx(wantSL, spec), formatPx(newExtreme, spec), cfg.TrailingDistPct))
+	live := fetchTrailingOrders()
+	result, err := okxRequest("GET", "/api/v5/account/positions", "")
+	if err != nil {
+		return
+	}
+	data, _ := result["data"].([]interface{})
+	for _, item := range data {
+		pos, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		sym, _ := pos["instId"].(string)
+		sz := parseFloatField(pos["pos"])
+		if sym == "" || sz <= 0 {
+			continue
+		}
+		side := "long"
+		if ps, _ := pos["posSide"].(string); strings.EqualFold(ps, "short") {
+			side = "short"
+		}
+		reconcileTrailingStop(sym, side, sz, parseFloatField(pos["avgPx"]),
+			parseFloatField(pos["markPx"]), cfg, live[sym])
+	}
 }
 
 // ==========================================
@@ -1769,6 +2156,43 @@ type PositionInfo struct {
 	Margin     float64
 }
 
+// cleanupPendingEntries membatalkan order entry LIMIT yang tidak terisi hingga
+// lewat tenggat (sinyal sudah basi). Order yang sudah terisi dihapus dari daftar.
+// Pembatalan order entry sekaligus membatalkan TP/SL attachAlgoOrds-nya di OKX.
+func cleanupPendingEntries(live map[string]PositionInfo) {
+	type pend struct{ ordID string }
+	toCancel := make(map[string]pend)
+
+	state.mu.Lock()
+	now := time.Now()
+	for symbol, pe := range pendingEntries {
+		if _, filled := live[symbol]; filled {
+			delete(pendingEntries, symbol) // terisi — posisi ditandai sync
+			continue
+		}
+		if now.After(pe.Deadline) {
+			toCancel[symbol] = pend{ordID: pe.OrdID}
+			delete(pendingEntries, symbol)
+		}
+	}
+	state.mu.Unlock()
+
+	for symbol, p := range toCancel {
+		body := fmt.Sprintf(`{"instId":%q,"ordId":%q}`, symbol, p.ordID)
+		resp, err := okxRequest("POST", "/api/v5/trade/cancel-order", body)
+		if err != nil {
+			addLog(fmt.Sprintf("[LIMIT ENTRY] Gagal batalkan order %s (%s): %v", symbol, p.ordID, err))
+			continue
+		}
+		code, _ := resp["code"].(string)
+		if code != "0" {
+			addLog(fmt.Sprintf("[LIMIT ENTRY] Gagal batalkan order %s (%s): code %s", symbol, p.ordID, code))
+			continue
+		}
+		addLog(fmt.Sprintf("[LIMIT ENTRY] Order %s (%s) dibatalkan — tidak terisi dalam %s", symbol, p.ordID, pendingEntryTTL))
+	}
+}
+
 func syncPositionsWithOKX() {
 	result, err := okxRequest("GET", "/api/v5/account/positions", "")
 	if err != nil {
@@ -1779,6 +2203,26 @@ func syncPositionsWithOKX() {
 	data, ok := result["data"].([]interface{})
 	if !ok {
 		return
+	}
+
+	// Daftar order trailing native OKX diambil SEKALI untuk semua instrumen,
+	// lalu dipakai oleh reconcileTrailingStop di bawah — jadi reconcile tidak
+	// menambah panggilan API per koin. Saat trailing dimatikan, panggilan ini
+	// hanya dilakukan sesekali untuk menyapu order yatim (lihat trailSweepDue).
+	trailCfg := func() Config {
+		state.mu.RLock()
+		defer state.mu.RUnlock()
+		return state.Config
+	}()
+	trailLive := map[string][]trailingOrderInfo{}
+	switch {
+	case trailCfg.TrailingEnabled:
+		trailLive = fetchTrailingOrders()
+	case hasTrailState() || trailSweepDue():
+		// Trailing dimatikan tapi mungkin masih ada order yang menggantung.
+		trailLive = fetchTrailingOrders()
+		sweepOrphanTrailing(trailLive)
+		trailLive = map[string][]trailingOrderInfo{}
 	}
 
 	// Kumpulkan posisi aktif di OKX
@@ -1843,17 +2287,15 @@ func syncPositionsWithOKX() {
 		// keluar tanpa log bila TP/SL sudah ada, sehingga aman dipanggil tiap sync.
 		go ensureTPSL(instId, strings.ToLower(side), info.Size, avgPrice, snapshotTpSlConfig())
 
-		// Trailing stop (F4): kelola SL dinamis bila konfigurasi aktif.
-		// Memakai harga mark dari OKX (bukan WS) supaya konsisten dengan posisi.
-		snapshotFull := func() Config {
-			state.mu.RLock()
-			defer state.mu.RUnlock()
-			return state.Config
-		}()
-		if snapshotFull.TrailingEnabled {
-			manageTrailing(instId, strings.ToLower(side), info.Size, avgPrice, markPx, snapshotFull)
-		}
+		// Trailing stop (F4): satu order native OKX (move_order_stop) yang
+		//_once_ dipasang; OKX yang menghitung & menggeser trigger-nya sendiri.
+		// Kalau order sudah cocok, reconcile tidak melakukan panggilan mutasi.
+		reconcileTrailingStop(instId, strings.ToLower(side), info.Size, avgPrice, markPx, trailCfg, trailLive[instId])
 	}
+
+	// Order entry LIMIT yang belum terisi: bila sudah terisi (ada di `live`),
+	// hapus dari daftar; bila lewat tenggat, batalkan (entry basi).
+	cleanupPendingEntries(live)
 
 	// Deteksi posisi yang baru saja tertutup oleh TP/SL OKX
 	openPosMu.Lock()
@@ -1871,7 +2313,9 @@ func syncPositionsWithOKX() {
 	}
 	openPosMu.Unlock()
 
-	// Tandai koin tanpa posisi di OKX sebagai flat
+	// Tandai koin tanpa posisi di OKX sebagai flat.
+	// TrailActive/TrailExtreme juga di-reset di sini: tanpa itu posisi berikutnya
+	// di simbol yang sama akan mewarisi state trailing harga lama (bug lama).
 	state.mu.Lock()
 	for symbol, coin := range state.Coins {
 		if _, isOpen := live[symbol]; !isOpen && coin.Position != "NONE" {
@@ -1879,9 +2323,25 @@ func syncPositionsWithOKX() {
 			coin.Contracts = 0
 			coin.EntryPrice = 0
 			coin.HasTPSL = false
+			coin.TrailActive = false
+			coin.TrailExtreme = 0
 		}
 	}
 	state.mu.Unlock()
+
+	// Order trailing untuk simbol yang TIDAK punya posisi harus dibatalkan.
+	// Order reduceOnly tidak akan membuka posisi terbalik, tapi kalau dibiarkan
+	// akan memenuhi batas pending trailing order OKX (maks 5 per instrumen) dan
+	// membuat order berikutnya gagal dipasang. Ini juga membersihkan order
+	// sisa dari proses sebelumnya / restart.
+	for symbol, orders := range trailLive {
+		if pos, isOpen := live[symbol]; !isOpen || pos.Size <= 0 {
+			if cancelTrailingOrders(orders) {
+				addLog(fmt.Sprintf("[TRAILING] %s: tidak ada posisi, trailing stop OKX dibatalkan", symbol))
+			}
+			clearTrailState(symbol)
+		}
+	}
 
 	// Hitung PnL riil dari OKX untuk posisi yang baru tertutup
 	for i, symbol := range closedSymbol {
@@ -2005,31 +2465,51 @@ var wsConnections = make(map[string]*websocket.Conn)
 var candleData = make(map[string][]float64)
 
 // CandleOHLC menyimpan OHLC satu candle — dibutuhkan untuk menghitung ATR
-// (indikator ini butuh high, low, close, bukan hanya close).
+// (high, low, close) dan strategi BB/RSI/EMA200 (open untuk entry LIMIT di
+// pembukaan candle berikutnya).
 type CandleOHLC struct {
-	Ts               int64 // unix millisecond — dipakai mencegah candle ganda
-	High, Low, Close float64
+	Ts                     int64 // unix millisecond — dipakai mencegah candle ganda
+	Open, High, Low, Close float64
 }
 
-// candleOHLC menyimpan maksimal 100 candle terakhir per simbol. Ditulis di
-// tempat yang sama dengan candleData (dalam kuncian state.mu).
+// candleOHLC menyimpan maksimal 260 candle terakhir per simbol — cukup untuk
+// EMA(200) + RSI(14) + BB(20) yang matang. Ditulis di tempat yang sama dengan
+// candleData (dalam kuncian state.mu).
 var candleOHLC = make(map[string][]CandleOHLC)
+
+// evalTsBySymbol melacak timestamp candle terakhir yang SUDAH dievaluasi
+// strategi. Strategi baru menilai sinyal SEKALI per candle yang baru ditutup,
+// lalu masuk di pembukaan candle berikutnya — guard ini mencegah order ganda
+// dari tick-tick berikutnya pada candle yang sama.
+var evalTsBySymbol = make(map[string]int64)
+
+// PendingEntry adalah order entry LIMIT yang menunggu terisi di OKX.
+type PendingEntry struct {
+	OrdID    string
+	Deadline time.Time
+}
+
+// pendingEntries melacak order entry limit yang belum terisi. Saat sudah
+// terisi, syncPositionsWithOKX menandai posisinya; bila lewat tenggat, order
+// dibatalkan (TP/SL attachAlgoOrds ikut batal otomatis).
+var pendingEntries = make(map[string]PendingEntry)
 
 // resetCandleHistory menghapus riwayat candle sebuah simbol.
 // PEMANGGIL WAJIB memegang state.mu (write lock).
 func resetCandleHistory(symbol string) {
 	delete(candleData, symbol)
 	delete(candleOHLC, symbol)
+	delete(evalTsBySymbol, symbol)
 }
 
 // ensureCandleHistory memastikan buffer candle sebuah simbol sudah ada.
 // PEMANGGIL WAJIB memegang state.mu (write lock).
 func ensureCandleHistory(symbol string) {
 	if _, ok := candleData[symbol]; !ok {
-		candleData[symbol] = make([]float64, 0, 100)
+		candleData[symbol] = make([]float64, 0, 260)
 	}
 	if _, ok := candleOHLC[symbol]; !ok {
-		candleOHLC[symbol] = make([]CandleOHLC, 0, 100)
+		candleOHLC[symbol] = make([]CandleOHLC, 0, 260)
 	}
 }
 
@@ -2195,20 +2675,25 @@ func startWebSocket(symbol string) {
 				if candleArr, ok := data[0].([]interface{}); ok && len(candleArr) >= 5 {
 					// Format candle OKX: [ts, open, high, low, close, vol, ...]
 					tsStr, ok0 := candleArr[0].(string)
+					openPriceStr, ok1 := candleArr[1].(string)
 					closePriceStr, ok := candleArr[4].(string)
 					highStr, ok2 := candleArr[2].(string)
 					lowStr, ok3 := candleArr[3].(string)
-					if !ok0 || !ok || !ok2 || !ok3 {
+					if !ok0 || !ok1 || !ok || !ok2 || !ok3 {
 						addLog(fmt.Sprintf("[WS DATA ERROR] %s: candle OHLC bukan string", symbol))
 						continue
 					}
 					candleTs, terr := strconv.ParseInt(tsStr, 10, 64)
+					openPrice, err0 := strconv.ParseFloat(openPriceStr, 64)
 					closePrice, err := strconv.ParseFloat(closePriceStr, 64)
 					highPrice, err2 := strconv.ParseFloat(highStr, 64)
 					lowPrice, err3 := strconv.ParseFloat(lowStr, 64)
-					if terr != nil || err != nil || err2 != nil || err3 != nil || closePrice <= 0 || highPrice < lowPrice || lowPrice <= 0 {
+					if terr != nil || err0 != nil || err != nil || err2 != nil || err3 != nil || closePrice <= 0 || highPrice < lowPrice || lowPrice <= 0 {
 						addLog(fmt.Sprintf("[WS DATA ERROR] %s: invalid candle OHLC (h=%s l=%s c=%s)", symbol, highStr, lowStr, closePriceStr))
 						continue
+					}
+					if openPrice <= 0 {
+						openPrice = closePrice // fallback bila open tidak terbaca
 					}
 
 					state.mu.Lock()
@@ -2219,15 +2704,15 @@ func startWebSocket(symbol string) {
 					state.Coins[symbol].Price = closePrice
 
 					candleData[symbol] = append(candleData[symbol], closePrice)
-					if len(candleData[symbol]) > 100 {
+					if len(candleData[symbol]) > 260 {
 						candleData[symbol] = candleData[symbol][1:]
 					}
-					// Riwayat OHLC khusus ATR, disimpan SEKALI per candle (dedupe
+					// Riwayat OHLC khusus indikator, disimpan SEKALI per candle (dedupe
 					// berdasarkan timestamp — WS mengirim candle yang sama berulang
 					// kali selama 5 menit saat harganya berubah).
 					if l := len(candleOHLC[symbol]); l == 0 || candleOHLC[symbol][l-1].Ts != candleTs {
-						candleOHLC[symbol] = append(candleOHLC[symbol], CandleOHLC{Ts: candleTs, High: highPrice, Low: lowPrice, Close: closePrice})
-						if len(candleOHLC[symbol]) > 100 {
+						candleOHLC[symbol] = append(candleOHLC[symbol], CandleOHLC{Ts: candleTs, Open: openPrice, High: highPrice, Low: lowPrice, Close: closePrice})
+						if len(candleOHLC[symbol]) > 260 {
 							candleOHLC[symbol] = candleOHLC[symbol][1:]
 						}
 					}
@@ -2310,16 +2795,16 @@ func checkTradingSignal(symbol string, currentPrice float64) {
 	plan := calculateOrderSize(symbol, currentPrice, margin, leverage)
 	applyOrderPlan(cs, plan, leverage)
 
-	prices := append([]float64(nil), candleData[symbol]...)
 	ohlc := append([]CandleOHLC(nil), candleOHLC[symbol]...)
 	position := cs.Position
 	lastSignalTime := cs.LastSignalTime
+	evalTs := evalTsBySymbol[symbol]
 	state.mu.Unlock()
 
-	if position != "NONE" || len(prices) < 10 {
-		// TP/SL sekarang ditangani langsung oleh OKX (attachAlgoOrds / order-algo),
-		// jadi bot TIDAK lagi menutup posisi manual. Ini mencegah partial close
-		// dan mencegah exit ganda ketika order TP OKX sudah dieksekusi.
+	if position != "NONE" || len(ohlc) < signalWarmupMin {
+		// TP/SL ditangani langsung oleh OKX (attachAlgoOrds / order-algo), jadi bot
+		// TIDAK lagi menutup posisi manual. Tanpa posisi kosong + candle yang cukup
+		// (EMA200 belum matang), strategi tidak dievaluasi.
 		return
 	}
 
@@ -2333,14 +2818,27 @@ func checkTradingSignal(symbol string, currentPrice float64) {
 		return
 	}
 
-	_, upperBand, lowerBand := indicator.BollingerBands(prices)
+	// Jangan menumpuk entry baru bila masih ada order limit yang menunggu terisi.
+	state.mu.RLock()
+	_, hasPending := pendingEntries[symbol]
+	state.mu.RUnlock()
+	if hasPending {
+		return
+	}
 
-	rsi, _ := indicator.Rsi(prices)
-	currentRSI := rsi[len(rsi)-1]
+	// Strategi BB(20,2) + RSI(14) + EMA200: sinyal dinilai SEKALI per candle yang
+	// baru saja ditutup, entry (LIMIT) dipasang di pembukaan candle berikutnya.
+	sig := evaluateReversalSignal(symbol, ohlc, currentPrice, evalTs)
 
-	buySignal := currentPrice <= lowerBand[len(lowerBand)-1]*1.001 && currentRSI < 30
-	sellSignal := currentPrice >= upperBand[len(upperBand)-1]*0.999 && currentRSI > 70
-	if !buySignal && !sellSignal {
+	// Tandai candle yang baru ditutup sebagai sudah dievaluasi, apa pun hasilnya,
+	// supaya tick-tick berikutnya dari candle yang sama tidak memicu ulang.
+	if sig.Evaluated {
+		state.mu.Lock()
+		evalTsBySymbol[symbol] = ohlc[len(ohlc)-2].Ts
+		state.mu.Unlock()
+	}
+
+	if !sig.Triggered {
 		return
 	}
 
@@ -2348,18 +2846,13 @@ func checkTradingSignal(symbol string, currentPrice float64) {
 		return // Max 5 concurrent trades reached
 	}
 
-	side, posSide, signalLabel := "sell", "short", "SELL SIGNAL (BB Upper + RSI>70)"
-	if buySignal {
-		side, posSide, signalLabel = "buy", "long", "BUY SIGNAL (BB Lower + RSI<30)"
-	}
-
 	state.mu.Lock()
-	cs.Signal = signalLabel
+	cs.Signal = sig.Label
 	cs.LastSignalTime = time.Now()
 	state.mu.Unlock()
 
-	addLog(fmt.Sprintf("[SIGNAL] %s: %s | Price: %.8f | RSI: %.2f | Size: %.4f kontrak | Margin: $%.2f (target $%.2f) | %dx",
-		symbol, strings.ToUpper(side), currentPrice, currentRSI, plan.Size, plan.MarginUsed, margin, leverage))
+	addLog(fmt.Sprintf("[SIGNAL] %s: %s | Close(C2): %.8f | RSI(C1): %.2f | EMA200: %.8f | Entry LIMIT @ %.8f | Size: %.4f kontrak | Margin: $%.2f (target $%.2f) | %dx",
+		symbol, strings.ToUpper(sig.Side), ohlc[len(ohlc)-2].Close, sig.RSIPrev, sig.EMA200, sig.EntryPx, plan.Size, plan.MarginUsed, margin, leverage))
 
 	if err := setLeverage(symbol, leverage); err != nil {
 		addLog(fmt.Sprintf("[WARN] Gagal set leverage %s: %v", symbol, err))
@@ -2373,24 +2866,22 @@ func checkTradingSignal(symbol string, currentPrice float64) {
 
 	// Hitung harga TP/SL lewat SATU fungsi yang sama dengan watchdog & reprice.
 	cfg := TpSlConfig{Mode: tpMode, TpPct: tpPct, SlPct: slPct, AtrPeriod: atrPeriod, AtrSlMult: atrSlMult, Leverage: leverage}
-	calc := computeTpSlByMode(cfg, side, currentPrice, spec, ohlc)
+	calc := computeTpSlByMode(cfg, sig.Side, sig.EntryPx, spec, ohlc)
 
-	res, err := placeOrder(symbol, side, plan.Size, currentPrice, calc.TpPx, calc.SlPx)
+	// Entry memakai LIMIT order (menekan fee) di harga pembukaan candle berikutnya.
+	// TP/SL dipasang SEKALIGUS via attachAlgoOrds dan berlaku saat order terisi.
+	res, err := placeLimitOrder(symbol, sig.Side, plan.Size, sig.EntryPx, calc.TpPx, calc.SlPx)
 	if err != nil {
-		addLog(fmt.Sprintf("[ERROR] Order %s %s gagal: %v", symbol, side, err))
+		addLog(fmt.Sprintf("[ERROR] Order %s %s gagal: %v", symbol, sig.Side, err))
 		return
 	}
 
+	// Catat order entry limit yang menunggu terisi. Saat terisi, syncPositionsWithOKX
+	// yang menandai posisi; bila tidak terisi dalam tenggat, order dibatalkan.
 	state.mu.Lock()
-	cs.Position = "LONG"
-	if side == "sell" {
-		cs.Position = "SHORT"
-	}
-	cs.EntryPrice = currentPrice
-	cs.Contracts = plan.Size
+	pendingEntries[symbol] = PendingEntry{OrdID: res.OrderID, Deadline: time.Now().Add(pendingEntryTTL)}
 	cs.TpPrice = calc.TpPx
 	cs.SlPrice = calc.SlPx
-	cs.HasTPSL = true
 	cs.TpDistPct = calc.TpDistPct
 	cs.SlDistPct = calc.SlDistPct
 	cs.TpSlMode = calc.Mode
@@ -2401,15 +2892,113 @@ func checkTradingSignal(symbol string, currentPrice float64) {
 	if calc.UsedPercent {
 		modeTag = "PERSEN (fallback, ATR belum cukup)"
 	}
-	addLog(fmt.Sprintf("[EXECUTED] %s %s [%s] | ordId: %s | %.4f kontrak | Notional $%.2f | Margin terpakai $%.2f | %dx | TP: %s (+%.2f%%) | SL: %s (-%.2f%%) | R:R 1:%.2f | 100%% posisi",
-		strings.ToUpper(posSide), symbol, modeTag, res.OrderID, plan.Size, plan.Notional, plan.MarginUsed, leverage,
+	addLog(fmt.Sprintf("[ORDER] %s %s LIMIT @ %.8f [%s] | ordId: %s | %.4f kontrak | Notional $%.2f | Margin terpakai $%.2f | %dx | TP: %s (+%.2f%%) | SL: %s (-%.2f%%) | R:R 1:%.2f | TP/SL lekat (attachAlgoOrds)",
+		strings.ToUpper(sig.PosSide), symbol, sig.EntryPx, modeTag, res.OrderID, plan.Size, plan.Notional, plan.MarginUsed, leverage,
 		formatPx(calc.TpPx, spec), calc.TpDistPct, formatPx(calc.SlPx, spec), calc.SlDistPct, calc.TpDistPct/calc.SlDistPct))
 
-	// Pastikan TP/SL benar-benar ada di OKX untuk 100% posisi
-	go ensureTPSL(symbol, posSide, plan.Size, currentPrice, cfg)
-
-	// Sinkronkan posisi & PnL aktual dari OKX
+	// Sinkronkan posisi & PnL aktual dari OKX (sekaligus batalkan entry basi)
 	go syncPositionsWithOKX()
+}
+
+// signalWarmupMin — jumlah minimum candle per simbol sebelum strategi dievaluasi.
+// Buffer menyimpan ~260 candle; ambang ini memastikan EMA(200), RSI(14), dan
+// BB(20) sudah matang sejak awal.
+const signalWarmupMin = 220
+
+// ReversalSignal adalah hasil evaluasi strategi BB(20,2) + RSI(14) + EMA200.
+type ReversalSignal struct {
+	Side      string  // buy / sell
+	PosSide   string  // long / short
+	Label     string  // label tampilan di UI & log
+	EntryPx   float64 // harga entry: pembukaan candle berikutnya
+	RSIPrev   float64 // RSI(14) pada candle sebelumnya (C1)
+	EMA200    float64 // EMA200 pada close candle terkini (C2)
+	UpperBand float64 // upper band BB pada C2
+	LowerBand float64 // lower band BB pada C2
+	Triggered bool
+	Evaluated bool // candle yang baru ditutup sudah dinilai (guard anti-duplikat)
+}
+
+// evaluateReversalSignal menerapkan aturan strategi:
+//
+//	buffer:  [ ... C1(C2-2) | C2(tutup) | C3(berjalan) ]
+//	LONG :  close C2 > EMA200  AND  RSI(C1) < 30  AND  low C1 < lower band C1
+//	        AND  close C2 > lower band C2  → entry LIMIT di open C3.
+//	SHORT:  close C2 < EMA200  AND  RSI(C1) > 70  AND  high C1 > upper band C1
+//	        AND  close C2 < upper band C2  → entry LIMIT di open C3.
+//
+// Sinyal dievaluasi SEKALI per candle yang baru ditutup (dijaga pemanggil lewat
+// evalTsBySymbol) dan masuk di pembukaan candle berikutnya memakai Limit Order.
+func evaluateReversalSignal(symbol string, ohlc []CandleOHLC, currentPrice float64, evalTs int64) ReversalSignal {
+	var r ReversalSignal
+	n := len(ohlc)
+	if n < signalWarmupMin {
+		return r // EMA200 belum matang
+	}
+	closed := ohlc[n-2]
+	// Evaluasi hanya untuk candle yang BARU ditutup; yang sama dilewati.
+	if evalTs == closed.Ts {
+		return r
+	}
+	if ohlc[n-1].Ts == closed.Ts {
+		return r // candle penutup belum tergantikan candle baru — jangan menilai
+	}
+	r.Evaluated = true
+
+	// Seri close PER-CANDLE (bukan per-tick) untuk indikator.
+	closesUpToC2 := make([]float64, n-1) // index 0..n-3 = C1, index n-2 = C2
+	for i := 0; i < n-1; i++ {
+		closesUpToC2[i] = ohlc[i].Close
+	}
+	closesUpToC1 := closesUpToC2[:n-2] // sampai C1
+
+	c1 := ohlc[n-3]
+	c2 := ohlc[n-2]
+
+	// EMA 200 = filter tren utama, dievaluasi pada close C2 (close terakhir yang sah).
+	ema := indicator.Ema(200, closesUpToC2)
+	emaAtC2 := ema[len(ema)-1]
+	if emaAtC2 <= 0 {
+		return r
+	}
+
+	// RSI(14) dihitung sampai C1 → "RSI pada candle sebelumnya".
+	_, rsi := indicator.Rsi(closesUpToC1)
+	rsiC1 := rsi[len(rsi)-1]
+
+	// Bollinger Bands(20,2) sampai C1 (band milik C1) dan sampai C2 (band milik C2).
+	_, upC1, lowC1 := indicator.BollingerBands(closesUpToC1)
+	lbC1, ubC1 := lowC1[len(lowC1)-1], upC1[len(upC1)-1]
+	_, upC2, lowC2 := indicator.BollingerBands(closesUpToC2)
+	lbC2, ubC2 := lowC2[len(lowC2)-1], upC2[len(upC2)-1]
+
+	r.RSIPrev = rsiC1
+	r.EMA200 = emaAtC2
+	r.UpperBand = ubC2
+	r.LowerBand = lbC2
+
+	// Harga entry: pembukaan candle berikutnya (C3 = candle yang sedang berjalan).
+	entryPx := ohlc[n-1].Open
+	if entryPx <= 0 {
+		entryPx = currentPrice
+	}
+	r.EntryPx = entryPx
+
+	// LONG: uptrend utama + koreksi sementara (oversold + rejection lower band).
+	if c2.Close > emaAtC2 && rsiC1 < 30 && c1.Low < lbC1 && c2.Close > lbC2 {
+		r.Side, r.PosSide = "buy", "long"
+		r.Label = "BUY SIGNAL (EMA200 uptrend + RSI<30 + BB Lower reversal)"
+		r.Triggered = true
+		return r
+	}
+	// SHORT: downtrend utama + reli sementara (overbought + rejection upper band).
+	if c2.Close < emaAtC2 && rsiC1 > 70 && c1.High > ubC1 && c2.Close < ubC2 {
+		r.Side, r.PosSide = "sell", "short"
+		r.Label = "SELL SIGNAL (EMA200 downtrend + RSI>70 + BB Upper reversal)"
+		r.Triggered = true
+		return r
+	}
+	return r
 }
 
 // ==========================================
@@ -2793,6 +3382,12 @@ func handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 		newConfig.AtrPeriod != state.Config.AtrPeriod ||
 		newConfig.AtrSlMult != state.Config.AtrSlMult
 
+	// Sama untuk trailing stop: perubahan toggle/jarak/pemicu berarti order
+	// move_order_stop di OKX harus dibikin ulang (atau dibatalkan saat OFF).
+	trailChanged := newConfig.TrailingEnabled != state.Config.TrailingEnabled ||
+		newConfig.TrailingTriggerPct != state.Config.TrailingTriggerPct ||
+		newConfig.TrailingDistPct != state.Config.TrailingDistPct
+
 	// Update config
 	state.Config.MarginUSDT = newConfig.MarginUSDT
 	state.Config.Leverage = newConfig.Leverage
@@ -2907,6 +3502,18 @@ func handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	// Trailing stop (F4): order native OKX dibuat ulang agar konfigurasi UI
+	// langsung berlaku untuk semua posisi terbuka. Saat toggle dimatikan,
+	// applyTrailingToOpenPositions membatalkan semua order yang menggantung.
+	if trailChanged {
+		snapshotCfg := func() Config {
+			state.mu.RLock()
+			defer state.mu.RUnlock()
+			return state.Config
+		}()
+		go applyTrailingToOpenPositions(snapshotCfg)
+	}
+
 	if newConfig.IsRunning {
 		state.mu.RLock()
 		bal := state.Balance
@@ -3012,30 +3619,48 @@ func cancelAlgoOrdersFor(symbol string) error {
 	return lastErr
 }
 
-// cancelPendingAlgoOrders membatalkan seluruh order TP/SL conditional yang menggantung.
-// label dipakai di pesan log (mis. "EMERGENCY" atau "LOSS LIMIT").
+// cancelPendingAlgoOrders membatalkan seluruh order algo yang menggantung:
+// TP/SL conditional (ordType=conditional) DAN trailing stop native
+// (ordType=move_order_stop). Keduanya wajib dibatalkan supaya tidak memicu
+// order reversal / order yatim setelah posisi ditutup paksa.
 func cancelPendingAlgoOrders(label string) {
-	result, err := okxRequest("GET", "/api/v5/trade/orders-algo-pending?ordType=conditional&instType=SWAP", "")
-	if err != nil {
-		return
-	}
-	data, _ := result["data"].([]interface{})
-	for _, item := range data {
-		algo, ok := item.(map[string]interface{})
-		if !ok {
+	total := 0
+	for _, ordType := range []string{"conditional", "move_order_stop"} {
+		path := fmt.Sprintf("/api/v5/trade/orders-algo-pending?ordType=%s&instType=SWAP", ordType)
+		result, err := okxRequest("GET", path, "")
+		if err != nil {
+			addLog(fmt.Sprintf("[%s] Gagal daftar algo %s: %v", label, ordType, err))
 			continue
 		}
-		algoId, _ := algo["algoId"].(string)
-		instId, _ := algo["instId"].(string)
-		if algoId == "" {
-			continue
-		}
-		body, _ := json.Marshal(map[string]interface{}{"instId": instId, "algoId": algoId})
-		if _, err := okxRequest("POST", "/api/v5/trade/cancel-algos", string(body)); err != nil {
-			addLog(fmt.Sprintf("[WARN] Gagal batalkan algo %s: %v", algoId, err))
+		data, _ := result["data"].([]interface{})
+		for _, item := range data {
+			algo, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			algoId, _ := algo["algoId"].(string)
+			instId, _ := algo["instId"].(string)
+			if algoId == "" {
+				continue
+			}
+			body, _ := json.Marshal(map[string]interface{}{"instId": instId, "algoId": algoId})
+			if _, err := okxRequest("POST", "/api/v5/trade/cancel-algos", string(body)); err != nil {
+				addLog(fmt.Sprintf("[WARN] Gagal batalkan algo %s: %v", algoId, err))
+				continue
+			}
+			total++
 		}
 	}
-	addLog(fmt.Sprintf("[%s] Semua order TP/SL pending dibatalkan", label))
+	addLog(fmt.Sprintf("[%s] %d order algo pending dibatalkan (TP/SL + trailing)", label, total))
+	// State trailing di dashboard harus ikut dibersihkan.
+	state.mu.Lock()
+	for _, c := range state.Coins {
+		if c != nil {
+			c.TrailActive = false
+			c.TrailExtreme = 0
+		}
+	}
+	state.mu.Unlock()
 }
 
 // ==========================================
@@ -3726,7 +4351,7 @@ const uiTemplate = `
                             <div class="flex items-center justify-between gap-3">
                                 <div>
                                     <p class="eyebrow mb-0.5">Trailing Stop</p>
-                                    <p class="text-[11px] t-subtle leading-snug">Kunci profit: SL pindah ke entry lalu mengikuti harga.</p>
+                                    <p class="text-[11px] t-subtle leading-snug">Native OKX: satu order trailing stop, digerakkan oleh exchange.</p>
                                 </div>
                                 <label class="switch">
                                     <input type="checkbox" x-model="trailingEnabled" class="sr-only">
@@ -3738,13 +4363,14 @@ const uiTemplate = `
                                     <div>
                                         <label class="eyebrow block mb-2">Trigger Profit (%)</label>
                                         <input type="number" step="0.1" min="0.05" x-model.number="trailingTriggerPct" class="field field-pos mono font-bold text-lg">
-                                        <p class="text-[11px] t-subtle mt-1.5">Saat profit ≥ trigger, SL dipindah ke harga entry (break-even).</p>
+                                        <p class="text-[11px] t-subtle mt-1.5">Harga aktivasi (activePx). Trailing diam sampai harga menyentuh level ini — jadi SL tidak pernah masuk sebelum profit mencapai trigger.</p>
                                     </div>
                                     <div>
                                         <label class="eyebrow block mb-2">Trailing Distance (%)</label>
                                         <input type="number" step="0.05" min="0.17" max="20" x-model.number="trailingDistPct" class="field field-neg mono font-bold text-lg">
-                                        <p class="text-[11px] t-subtle mt-1.5">SL = harga ekstrem − jarak ini. Wajib &gt; 0.17% (biaya round-trip OKX ~0.16%) agar tidak tersentuh hanya karena fee. SL hanya bergerak menguntungkan, tidak pernah mundur.</p>
+                                        <p class="text-[11px] t-subtle mt-1.5">Jarak SL dari harga ekstrem (callbackRatio). Wajib &gt; 0.17% (biaya round-trip OKX ~0.16%) agar tidak tersentuh hanya karena fee. SL hanya bergerak menguntungkan, tidak pernah mundur.</p>
                                     </div>
+                                    <p class="text-[11px] t-subtle leading-relaxed">Order dipasang sekali per posisi lalu dikelola penuh oleh OKX — bot tidak amends order secara berkala. Saat toggle dimatikan, order trailing yang menggantung otomatis dibatalkan.</p>
                                 </div>
                             </template>
                         </div>
@@ -3932,8 +4558,9 @@ const uiTemplate = `
                         <span class="chip shrink-0"
                               :class="coinStates[coin]?.position === 'LONG' ? 'chip-long' : (coinStates[coin]?.position === 'SHORT' ? 'chip-short' : 'chip-idle')"
                               x-text="coinStates[coin]?.position || 'IDLE'"></span>
-                        <!-- Trailing stop aktif (F4) -->
-                        <span x-show="coinStates[coin]?.trailActive" class="chip chip-trail shrink-0">
+                        <!-- Trailing stop OKX aktif (F4) -->
+                        <span x-show="coinStates[coin]?.trailActive" class="chip chip-trail shrink-0"
+                              :title="(coinStates[coin]?.trailExtreme || 0) > 0 ? 'Trailing stop OKX di ' + coinStates[coin].trailExtreme.toFixed(6) : 'Trailing stop OKX menunggu aktivasi'">
                             <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6"></path></svg>
                             TRAIL
                         </span>
@@ -3973,7 +4600,10 @@ const uiTemplate = `
                                 </div>
                                 <div x-show="coinStates[coin]?.trailActive" class="flex justify-between items-center gap-2">
                                     <dt>Trailing</dt>
-                                    <dd class="mono font-bold t-warn" x-text="'AKTIF • ekstrem ' + (coinStates[coin]?.trailExtreme?.toFixed(6) || '-')"></dd>
+                                    <dd class="mono font-bold t-warn"
+                                        x-text="(coinStates[coin]?.trailExtreme || 0) > 0
+                                            ? 'SL ' + coinStates[coin].trailExtreme.toFixed(6)
+                                            : 'MENUNGGU AKTIVASI'"></dd>
                                 </div>
                             </div>
                         </template>

@@ -1,6 +1,6 @@
 # OKX Scalper Bot
 
-Bot dengan dashboard web responsif untuk memantau candle swap USDT OKX dan menjalankan strategi Bollinger Bands + RSI. Defaultnya **demo trading**. Mode live tersedia, tetapi mengirim order sungguhan dan berisiko kehilangan dana.
+Bot dengan dashboard web responsif untuk memantau candle swap USDT OKX dan menjalankan strategi **Long/Short berbasis Bollinger Bands (20,2) + RSI (14) + EMA 200**. Defaultnya **demo trading**. Mode live tersedia, tetapi mengirim order sungguhan dan berisiko kehilangan dana.
 
 > **Peringatan:** Jangan beralih ke live sebelum menguji demo dan memverifikasi ukuran kontrak, parameter order, leverage, serta status posisi di akun OKX. Ini bukan sistem trading siap produksi.
 
@@ -37,7 +37,7 @@ Bot dengan dashboard web responsif untuk memantau candle swap USDT OKX dan menja
 | **F1 Position Sizing** | Margin per trade bisa dihitung dari **% saldo** atau **nominal tetap (USDT)** dengan toggle On/Off. Saat OFF, memakai margin tetap dari konfigurasi. |
 | **F2 Daily Loss Limit** | Batas kerugian harian (realized + unrealized, sejak 00:00 UTC) memicu **shutdown otomatis + tutup semua posisi**. Reset tiap 00:00 UTC. |
 | **F3 Time Filter** | Entry baru hanya di dalam jendela sesi pasar (UTC): Asian, London, New York, NY–London Overlap, atau custom. Posisi terbuka tetap dikelola di luar sesi. |
-| **F4 Trailing Stop** | Setelah profit mencapai trigger, SL dipindah ke harga entry (break-even), lalu mengikuti harga ekstrem dengan jarak trailing — SL hanya bergerak menguntungkan, tidak pernah mundur. |
+| **F4 Trailing Stop** | Native OKX (`move_order_stop`): satu order dengan `callbackRatio` (jarak) + `activePx` (harga aktivasi), digerakkan penuh oleh exchange — SL hanya bergerak menguntungkan, tidak pernah mundur. |
 | **Sinkronisasi OKX** | Posisi, ukuran kontrak, dan PnL diambil dari OKX tiap 10 detik. |
 | **PnL riil** | Dihitung dari riwayat fill OKX (`/api/v5/trade/fills`) termasuk fee. |
 | **Peringkat konfigurasi** | Instrumen yang delisted dari OKX ditolak backend dengan HTTP 400. |
@@ -192,28 +192,73 @@ Empat fitur tambahan untuk position sizing, proteksi harian, filter sesi, dan tr
 - Posisi yang sudah terbuka **tetap dipantau dan dikelola** (TP/SL, trailing) meskipun waktu sudah keluar dari sesi.
 - Jendela custom mendukung lintas tengah malam (mis. `22:00–02:00`).
 
-### F4 — Trailing Stop
+### F4 — Trailing Stop (native OKX)
 
 - Toggle **On/Off**; wajib input **Trigger Profit %** dan **Trailing Distance %**.
-- Alur:
-  1. Sebelum profit mencapai trigger → SL tetap (fixed dari mode ATR/persen). Hanya harga ekstrem yang dicatat.
-  2. Saat `profit ≥ Trigger` → SL dipindah ke **harga entry (break-even)**.
-  3. Selanjutnya SL mengikuti harga: `SL = harga ekstrem − trailing distance` (LONG) atau `SL = harga ekstrem + trailing distance` (SHORT).
-- **Aturan mutlak**: SL hanya boleh bergerak menguntungkan (naik untuk LONG, turun untuk SHORT), tidak pernah mundur.
+- **Dikerjakan sepenuhnya oleh OKX, bukan oleh server bot.** Satu order
+  `ordType=move_order_stop` dipasang per posisi, lalu exchange yang menghitung
+  dan menggeser trigger price-nya. Bot tidak pernah menghitung harga SL trailing
+  dan tidak amends order secara berkala.
+- Pemetaan konfigurasi → parameter OKX:
+
+  | Konfigurasi | Parameter OKX | Arti |
+  |---|---|---|
+  | `TrailingDistance %` | `callbackRatio` | Jarak SL dari harga ekstrem (`0.3%` → `0.003`) |
+  | `Trigger Profit %` | `activePx` | Harga aktivasi; sebelum tercapai trailing diam |
+
+- Alur di sisi OKX:
+  1. `activePx` belum tersentuh → order diam, SL fixed dari mode ATR/persen tetap melindungi.
+  2. Harga mencapai `activePx` → OKX mulai melacak harga.
+  3. Setelah aktif, trigger price = harga tertinggi sejak dipasang × `(1 − callbackRatio)` (LONG) atau harga terendah × `(1 + callbackRatio)` (SHORT).
+  4. SL hanya bergerak menguntungkan — dijamin oleh exchange, tidak mungkin mundur.
+- **Beban server:** saat konfigurasi tidak berubah, reconcile hanya **membaca**
+  daftar order trailing (1 panggilan per siklus sinkronisasi untuk *semua*
+  instrumen) dan **tidak melakukan panggilan mutasi apa pun**. Order baru hanya
+  dibuat saat posisi muncul atau konfigurasi berubah, dengan cooldown 60 detik.
+- **Toggle OFF** → semua order trailing yang menggantung dibatalkan, dan tidak
+  ada order trailing baru yang dibuat.
+- Order trailing memakai `reduceOnly`, jadi tidak pernah membuka posisi
+  terbalik, dan aman berdampingan dengan TP/SL conditional yang sudah terpasang.
+- Order trailing ikut dibatalkan saat posisi ditutup, saat emergency close, dan
+  saat daily loss limit terpicu — supaya tidak memenuhi batas 5 pending
+  trailing order per instrumen di OKX.
 - **Trailing distance wajib > 0.17%** — di atas biaya round-trip OKX (~0.16%) — agar SL tidak tersentuh hanya karena fee.
-- Update SL memakai `replaceTpSl` (TP lama dipertahankan) dengan cooldown yang sama dengan watchdog, sehingga tidak membombardir OKX saat harga naik terus.
-- Harga ekstrem & status trailing tampil di kartu koin (badge `TRAIL`).
+- Harga trigger trailing yang dihitung OKX tampil di kartu koin (badge `TRAIL`,
+  `MENUNGGU AKTIVASI` sebelum `activePx` tersentuh).
 
-## Strategi
+## Strategi (Long/Short — BB + RSI + EMA 200)
 
-- Timeframe default: `5m`.
-- Sinyal BUY: harga menyentuh area Bollinger Band bawah dan RSI di bawah 30.
-- Sinyal SELL: harga menyentuh area Bollinger Band atas dan RSI di atas 70.
-- Minimal 10 sampel harga sebelum indikator dihitung (riwayat di-seed dari REST saat startup).
-- Cooldown 5 menit per koin antar sinyal.
+Strategi reversal berbasis tiga indikator, dievaluasi **sekalipun per candle yang baru ditutup**, dan entry dipasang di **pembukaan candle berikutnya** memakai **Limit Order** (fee lebih rendah).
+
+- Timeframe: `5m` (default) atau `15m` — ubah lewat dashboard (`timeframe`).
+- Indikator: **Bollinger Bands (20, 2)**, **RSI (14)** ambang 30/70, **EMA 200** sebagai filter tren utama.
+- Buffer candle 250+ titik di-seed dari REST OKX saat startup agar semua indikator matang.
+
+### Skenario LONG (uptrend + koreksi sementara)
+
+1. Filter tren: **Close C2 > EMA 200** (uptrend utama).
+2. Oversold: **RSI(14) < 30** pada candle sebelumnya (C1).
+3. Konfirmasi reversal:
+   - C1 sempat **menembus ke bawah Lower Band** (low C1 < LB C1).
+   - C2 (candle terkini yang ditutup) **kembali tutup di atas Lower Band** (close C2 > LB C2).
+4. Action: buka **Long** di pembukaan candle berikutnya (C3) dengan **Limit Order**.
+
+### Skenario SHORT (downtrend + reli sementara)
+
+1. Filter tren: **Close C2 < EMA 200** (downtrend utama).
+2. Overbought: **RSI(14) > 70** pada candle sebelumnya (C1).
+3. Konfirmasi reversal:
+   - C1 sempat **menembus ke atas Upper Band** (high C1 > UB C1).
+   - C2 **kembali tutup di bawah Upper Band** (close C2 < UB C2).
+4. Action: buka **Short** di pembukaan candle berikutnya (C3) dengan **Limit Order**.
+
+### Parameter eksekusi
+
+- Entry memakai **Limit Order** di harga open C3; bila tidak terisi dalam **3 menit**, order dibatalkan otomatis (sinyal basi).
+- Maks 1 sinyal per candle per koin + cooldown 5 menit (anti-spam).
 - Maks 5 posisi bersamaan.
-- TP/SL default: mode **ATR** (SL = ATR 14×1.0, TP = 2× SL → rasio 1:2); fallback persen `TP 0.8% / SL 0.4%`.
-- Market order, margin isolated, leverage mengikuti input dashboard (`set-leverage` dipanggil sebelum tiap order).
+- TP/SL default: mode **ATR** (SL = ATR 14×1.0, TP = 2× SL → rasio 1:2); fallback persen `TP 0.8% / SL 0.4%`. TP/SL terpasang bersama entry via `attachAlgoOrds`.
+- Margin isolated, leverage mengikuti input dashboard (`set-leverage` dipanggil sebelum tiap order).
 
 Koin yang margin-nya tidak cukup untuk 1 lot tidak akan di-order; dashboard menampilkan nilai margin minimum yang dibutuhkan.
 
@@ -285,7 +330,7 @@ Accordron yang tertutup secara default (tidak tergeser saat scroll). Isi:
 4. **F1 Position Sizing** — toggle On/Off, mode `% Saldo` / `Nominal (USDT)`, dengan pratinjau margin efektif dan validasi (≤100% / ≤ saldo).
 5. **F2 Daily Loss Limit** — toggle On/Off, mode `%` / `Nominal USDT`, status PnL harian + batas, dan indikator kunci engine saat limit tercapai.
 6. **F3 Time Filter** — dropdown sesi + input jam custom (UTC) + chip status `SESI AKTIF` / `DI LUAR SESI`.
-7. **F4 Trailing Stop** — toggle On/Off, input trigger & distance, catatan wajib distance > 0.17%.
+7. **F4 Trailing Stop** — toggle On/Off, input trigger & distance, catatan wajib distance > 0.17%. Trailing ditangani native OKX (`move_order_stop`); toggle Off langsung membatalkan order yang menggantung.
 8. **5 dropdown instrumen** — 35 koin terverifikasi + `None`.
 
 Kartu **Risk : Reward** dan **Break-even WR** di hero otomatis mengikuti mode (ATR → tetap `1 : 2.00`, WR 33.3%). Kartu koin menampilkan jarak TP/SL aktual per posisi (`tpDistPct`/`slDistPct`) beserta R:R per koin — di mode ATR jaraknya berbeda tiap posisi karena volatilitas berbeda. Hero juga menampilkan **Balance (USDT)** dan **PnL hari ini**; bila daily loss limit tercapai muncul banner merah peringatan.
