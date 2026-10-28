@@ -11,6 +11,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -87,6 +88,10 @@ type Config struct {
 	TrailingEnabled    bool    `json:"trailingEnabled"`
 	TrailingTriggerPct float64 `json:"trailingTriggerPct"` // % profit untuk aktivasi (BEP)
 	TrailingDistPct    float64 `json:"trailingDistPct"`    // % jarak trailing dari ekstrem
+
+	// --- F5: Entry strategy ---------------------------------------------
+	StrategyMode string `json:"strategyMode"`
+	TradingStyle string `json:"tradingStyle"`
 }
 
 // Default TP/SL: rasio risiko:hadiah 1:2 yang BENAR.
@@ -150,6 +155,17 @@ const (
 
 	// trailingMaxDistPct: batas wajar atas jarak trailing.
 	trailingMaxDistPct = 20.0
+)
+
+const (
+	stratLegacy        = "bb_rsi_ema200"
+	stratEmaRsi        = "ema_rsi"
+	stratMtfConfluence = "mtf_confluence"
+	stratAdvancedSmc   = "advanced_smc"
+	styleConservative  = "conservative"
+	styleAggressive    = "aggressive"
+	adxTrendThreshold  = 25.0
+	mtfCacheTTL        = time.Minute
 )
 
 // sessionWindow mengembalikan jendela sesi (jam UTC, 0-23) untuk mode filter.
@@ -309,6 +325,8 @@ func loadConfigFromEnv() Config {
 		TimeFilterMode:     timeFilter247,
 		TrailingTriggerPct: 0.5, // aktivasi trailing di profit >= 0.5%
 		TrailingDistPct:    0.3, // jarak trailing 0.3% dari harga ekstrem
+		StrategyMode:       stratMtfConfluence,
+		TradingStyle:       styleConservative,
 	}
 }
 
@@ -618,7 +636,6 @@ func seedCandleHistory(symbol string) {
 	}
 
 	// Data datang dari candle TERBARU ke terlama — balikkan agar kronologis.
-	closes := make([]float64, 0, 250)
 	ohlcs := make([]CandleOHLC, 0, 250)
 	for i := len(parsed.Data) - 1; i >= 0; i-- {
 		arr, ok := parsed.Data[i].([]interface{})
@@ -630,31 +647,40 @@ func seedCandleHistory(symbol string) {
 		hStr, _ := arr[2].(string)
 		lStr, _ := arr[3].(string)
 		cStr, _ := arr[4].(string)
+		volStr := ""
+		if len(arr) > 5 {
+			volStr, _ = arr[5].(string)
+		}
 		ts, terr := strconv.ParseInt(tsStr, 10, 64)
 		openPx, oerr := strconv.ParseFloat(oStr, 64)
 		high, herr := strconv.ParseFloat(hStr, 64)
 		low, lerr := strconv.ParseFloat(lStr, 64)
 		closePx, cerr := strconv.ParseFloat(cStr, 64)
+		volume, verr := strconv.ParseFloat(volStr, 64)
 		if oerr != nil || openPx <= 0 {
 			openPx = closePx // fallback bila open tidak bisa dibaca
 		}
-		if terr != nil || herr != nil || lerr != nil || cerr != nil || closePx <= 0 || high < low || low <= 0 {
+		if terr != nil || herr != nil || lerr != nil || cerr != nil || verr != nil ||
+			closePx <= 0 || high < low || low <= 0 || volume < 0 {
 			continue
 		}
-		closes = append(closes, closePx)
-		ohlcs = append(ohlcs, CandleOHLC{Ts: ts, Open: openPx, High: high, Low: low, Close: closePx})
+		ohlcs = append(ohlcs, CandleOHLC{Ts: ts, Open: openPx, High: high, Low: low, Close: closePx, Volume: volume})
 	}
-	if len(closes) == 0 {
+	if len(ohlcs) == 0 {
 		return
 	}
 
 	state.mu.Lock()
-	if len(candleData[symbol]) < len(closes) {
+	if len(candleData[symbol]) < len(ohlcs) {
+		closes := make([]float64, len(ohlcs))
+		for i, candle := range ohlcs {
+			closes[i] = candle.Close
+		}
 		candleData[symbol] = closes
 		candleOHLC[symbol] = ohlcs
 	}
 	state.mu.Unlock()
-	addLog(fmt.Sprintf("[CANDLE HISTORY] %s: %d candle %s dimuat (EMA200/RSI/BB siap)", symbol, len(closes), tf))
+	addLog(fmt.Sprintf("[CANDLE HISTORY] %s: %d candle %s dimuat", symbol, len(ohlcs), tf))
 }
 
 // TpSlConfig adalah snapshot konfigurasi TP/SL yang dipakai dalam SATU
@@ -2464,18 +2490,28 @@ func getOpenPositionCount() int {
 var wsConnections = make(map[string]*websocket.Conn)
 var candleData = make(map[string][]float64)
 
-// CandleOHLC menyimpan OHLC satu candle — dibutuhkan untuk menghitung ATR
-// (high, low, close) dan strategi BB/RSI/EMA200 (open untuk entry LIMIT di
-// pembukaan candle berikutnya).
+// CandleOHLC menyimpan OHLCV satu candle — dibutuhkan untuk indikator dan
+// strategi yang menggunakan volume.
 type CandleOHLC struct {
 	Ts                     int64 // unix millisecond — dipakai mencegah candle ganda
 	Open, High, Low, Close float64
+	Volume                 float64
 }
 
 // candleOHLC menyimpan maksimal 260 candle terakhir per simbol — cukup untuk
 // EMA(200) + RSI(14) + BB(20) yang matang. Ditulis di tempat yang sama dengan
 // candleData (dalam kuncian state.mu).
 var candleOHLC = make(map[string][]CandleOHLC)
+
+type mtfCandleCacheEntry struct {
+	candles   []CandleOHLC
+	fetchedAt time.Time
+}
+
+var mtfCandleCache = struct {
+	sync.RWMutex
+	entries map[string]mtfCandleCacheEntry
+}{entries: make(map[string]mtfCandleCacheEntry)}
 
 // evalTsBySymbol melacak timestamp candle terakhir yang SUDAH dievaluasi
 // strategi. Strategi baru menilai sinyal SEKALI per candle yang baru ditutup,
@@ -2683,12 +2719,22 @@ func startWebSocket(symbol string) {
 						addLog(fmt.Sprintf("[WS DATA ERROR] %s: candle OHLC bukan string", symbol))
 						continue
 					}
+					if len(candleArr) <= 5 {
+						addLog(fmt.Sprintf("[WS DATA ERROR] %s: candle volume tidak tersedia", symbol))
+						continue
+					}
+					volumeStr, ok := candleArr[5].(string)
+					if !ok {
+						addLog(fmt.Sprintf("[WS DATA ERROR] %s: candle volume bukan string", symbol))
+						continue
+					}
 					candleTs, terr := strconv.ParseInt(tsStr, 10, 64)
 					openPrice, err0 := strconv.ParseFloat(openPriceStr, 64)
 					closePrice, err := strconv.ParseFloat(closePriceStr, 64)
 					highPrice, err2 := strconv.ParseFloat(highStr, 64)
 					lowPrice, err3 := strconv.ParseFloat(lowStr, 64)
-					if terr != nil || err0 != nil || err != nil || err2 != nil || err3 != nil || closePrice <= 0 || highPrice < lowPrice || lowPrice <= 0 {
+					volume, err4 := strconv.ParseFloat(volumeStr, 64)
+					if terr != nil || err0 != nil || err != nil || err2 != nil || err3 != nil || err4 != nil || closePrice <= 0 || highPrice < lowPrice || lowPrice <= 0 || volume < 0 {
 						addLog(fmt.Sprintf("[WS DATA ERROR] %s: invalid candle OHLC (h=%s l=%s c=%s)", symbol, highStr, lowStr, closePriceStr))
 						continue
 					}
@@ -2707,15 +2753,24 @@ func startWebSocket(symbol string) {
 					if len(candleData[symbol]) > 260 {
 						candleData[symbol] = candleData[symbol][1:]
 					}
-					// Riwayat OHLC khusus indikator, disimpan SEKALI per candle (dedupe
-					// berdasarkan timestamp — WS mengirim candle yang sama berulang
-					// kali selama 5 menit saat harganya berubah).
-					if l := len(candleOHLC[symbol]); l == 0 || candleOHLC[symbol][l-1].Ts != candleTs {
-						candleOHLC[symbol] = append(candleOHLC[symbol], CandleOHLC{Ts: candleTs, Open: openPrice, High: highPrice, Low: lowPrice, Close: closePrice})
-						if len(candleOHLC[symbol]) > 260 {
-							candleOHLC[symbol] = candleOHLC[symbol][1:]
+					// WS mengirim candle yang sedang berjalan berulang kali. Simpan
+					// versi terbarunya agar OHLCV candle tertutup tidak stale.
+					candles := candleOHLC[symbol]
+					if l := len(candles); l > 0 && candles[l-1].Ts == candleTs {
+						candles[l-1].High = highPrice
+						candles[l-1].Low = lowPrice
+						candles[l-1].Close = closePrice
+						candles[l-1].Volume = volume
+					} else {
+						candles = append(candles, CandleOHLC{
+							Ts: candleTs, Open: openPrice, High: highPrice, Low: lowPrice,
+							Close: closePrice, Volume: volume,
+						})
+						if len(candles) > 260 {
+							candles = candles[1:]
 						}
 					}
+					candleOHLC[symbol] = candles
 
 					isRunning := state.Config.IsRunning
 					state.mu.Unlock()
@@ -2801,10 +2856,9 @@ func checkTradingSignal(symbol string, currentPrice float64) {
 	evalTs := evalTsBySymbol[symbol]
 	state.mu.Unlock()
 
-	if position != "NONE" || len(ohlc) < signalWarmupMin {
+	if position != "NONE" {
 		// TP/SL ditangani langsung oleh OKX (attachAlgoOrds / order-algo), jadi bot
-		// TIDAK lagi menutup posisi manual. Tanpa posisi kosong + candle yang cukup
-		// (EMA200 belum matang), strategi tidak dievaluasi.
+		// TIDAK lagi menutup posisi manual.
 		return
 	}
 
@@ -2826,9 +2880,9 @@ func checkTradingSignal(symbol string, currentPrice float64) {
 		return
 	}
 
-	// Strategi BB(20,2) + RSI(14) + EMA200: sinyal dinilai SEKALI per candle yang
-	// baru saja ditutup, entry (LIMIT) dipasang di pembukaan candle berikutnya.
-	sig := evaluateReversalSignal(symbol, ohlc, currentPrice, evalTs)
+	// Strategi menilai candle yang sudah ditutup; order LIMIT memakai open candle
+	// yang sedang berjalan sebagai harga entry.
+	sig := evaluateConfiguredSignal(symbol, ohlc, currentPrice, evalTs, cfgSnapshot)
 
 	// Tandai candle yang baru ditutup sebagai sudah dievaluasi, apa pun hasilnya,
 	// supaya tick-tick berikutnya dari candle yang sama tidak memicu ulang.
@@ -2851,8 +2905,8 @@ func checkTradingSignal(symbol string, currentPrice float64) {
 	cs.LastSignalTime = time.Now()
 	state.mu.Unlock()
 
-	addLog(fmt.Sprintf("[SIGNAL] %s: %s | Close(C2): %.8f | RSI(C1): %.2f | EMA200: %.8f | Entry LIMIT @ %.8f | Size: %.4f kontrak | Margin: $%.2f (target $%.2f) | %dx",
-		symbol, strings.ToUpper(sig.Side), ohlc[len(ohlc)-2].Close, sig.RSIPrev, sig.EMA200, sig.EntryPx, plan.Size, plan.MarginUsed, margin, leverage))
+	addLog(fmt.Sprintf("[SIGNAL] %s: %s | %s (%s) | Entry LIMIT @ %.8f | Size: %.4f kontrak | Margin: $%.2f (target $%.2f) | %dx",
+		symbol, strings.ToUpper(sig.Side), cfgSnapshot.StrategyMode, cfgSnapshot.TradingStyle, sig.EntryPx, plan.Size, plan.MarginUsed, margin, leverage))
 
 	if err := setLeverage(symbol, leverage); err != nil {
 		addLog(fmt.Sprintf("[WARN] Gagal set leverage %s: %v", symbol, err))
@@ -2999,6 +3053,365 @@ func evaluateReversalSignal(symbol string, ohlc []CandleOHLC, currentPrice float
 		return r
 	}
 	return r
+}
+
+func evaluateConfiguredSignal(symbol string, ohlc []CandleOHLC, currentPrice float64, evalTs int64, cfg Config) ReversalSignal {
+	mode := cfg.StrategyMode
+	if mode == "" {
+		mode = stratLegacy
+	}
+	if mode == stratLegacy {
+		return evaluateReversalSignal(symbol, ohlc, currentPrice, evalTs)
+	}
+	if len(ohlc) < 2 {
+		return ReversalSignal{}
+	}
+
+	closed := ohlc[len(ohlc)-2]
+	if closed.Ts == evalTs || ohlc[len(ohlc)-1].Ts == closed.Ts {
+		return ReversalSignal{}
+	}
+
+	result := ReversalSignal{Evaluated: true}
+	entryPrice := ohlc[len(ohlc)-1].Open
+	if entryPrice <= 0 {
+		entryPrice = currentPrice
+	}
+	result.EntryPx = entryPrice
+	closedCandles := ohlc[:len(ohlc)-1]
+
+	if cfg.TradingStyle == styleConservative && mode != stratAdvancedSmc && !isTrendStrong(closedCandles) {
+		addLog(fmt.Sprintf("[%s][FILTER] ADX rendah — market sideways, skip entry", symbol))
+		return result
+	}
+
+	var direction string
+	switch mode {
+	case stratEmaRsi:
+		direction = checkEmaRsi(closedCandles, cfg.TradingStyle)
+	case stratMtfConfluence:
+		direction = checkMtfConfluence(symbol, cfg.TradingStyle)
+	case stratAdvancedSmc:
+		direction = checkAdvancedSmc(closedCandles, cfg.TradingStyle)
+	default:
+		addLog(fmt.Sprintf("[%s][STRATEGY] mode tidak dikenal %q", symbol, mode))
+		return result
+	}
+	if direction == "LONG" {
+		result.Side, result.PosSide = "buy", "long"
+		result.Label = fmt.Sprintf("BUY SIGNAL (%s, %s)", mode, cfg.TradingStyle)
+		result.Triggered = true
+	} else if direction == "SHORT" {
+		result.Side, result.PosSide = "sell", "short"
+		result.Label = fmt.Sprintf("SELL SIGNAL (%s, %s)", mode, cfg.TradingStyle)
+		result.Triggered = true
+	}
+	return result
+}
+
+func isTrendStrong(candles []CandleOHLC) bool {
+	adx, ok := adxValue(candles, 14)
+	return ok && adx >= adxTrendThreshold
+}
+
+func adxValue(candles []CandleOHLC, period int) (float64, bool) {
+	if period < 2 || len(candles) < 2*period {
+		return 0, false
+	}
+
+	// Wilder-smooth true range and directional movement, then smooth DX into ADX.
+	trueRanges := make([]float64, len(candles)-1)
+	positiveDM := make([]float64, len(candles)-1)
+	negativeDM := make([]float64, len(candles)-1)
+	for i := 1; i < len(candles); i++ {
+		current, previous := candles[i], candles[i-1]
+		upMove := current.High - previous.High
+		downMove := previous.Low - current.Low
+		if upMove > downMove && upMove > 0 {
+			positiveDM[i-1] = upMove
+		}
+		if downMove > upMove && downMove > 0 {
+			negativeDM[i-1] = downMove
+		}
+		trueRanges[i-1] = math.Max(current.High-current.Low, math.Max(
+			math.Abs(current.High-previous.Close), math.Abs(current.Low-previous.Close)))
+	}
+
+	var smoothedTR, smoothedPositiveDM, smoothedNegativeDM float64
+	for i := 0; i < period; i++ {
+		smoothedTR += trueRanges[i]
+		smoothedPositiveDM += positiveDM[i]
+		smoothedNegativeDM += negativeDM[i]
+	}
+
+	dx := make([]float64, 0, len(candles)-2*period+1)
+	appendDX := func() {
+		if smoothedTR <= 0 {
+			dx = append(dx, 0)
+			return
+		}
+		plusDI := 100 * smoothedPositiveDM / smoothedTR
+		minusDI := 100 * smoothedNegativeDM / smoothedTR
+		denominator := plusDI + minusDI
+		if denominator == 0 {
+			dx = append(dx, 0)
+			return
+		}
+		dx = append(dx, 100*math.Abs(plusDI-minusDI)/denominator)
+	}
+	appendDX()
+	for i := period; i < len(trueRanges); i++ {
+		smoothedTR = smoothedTR - smoothedTR/float64(period) + trueRanges[i]
+		smoothedPositiveDM = smoothedPositiveDM - smoothedPositiveDM/float64(period) + positiveDM[i]
+		smoothedNegativeDM = smoothedNegativeDM - smoothedNegativeDM/float64(period) + negativeDM[i]
+		appendDX()
+	}
+	if len(dx) < period {
+		return 0, false
+	}
+
+	var adx float64
+	for _, value := range dx[:period] {
+		adx += value
+	}
+	adx /= float64(period)
+	for _, value := range dx[period:] {
+		adx = (adx*float64(period-1) + value) / float64(period)
+	}
+	return adx, true
+}
+
+func checkEmaRsi(candles []CandleOHLC, style string) string {
+	if len(candles) < 55 {
+		return "NONE"
+	}
+	closes := make([]float64, len(candles))
+	for i, candle := range candles {
+		closes[i] = candle.Close
+	}
+	ema := indicator.Ema(50, closes)
+	_, rsi := indicator.Rsi(closes)
+	if len(ema) == 0 || len(rsi) < 2 {
+		return "NONE"
+	}
+
+	oversoldLine, overboughtLine := 35.0, 65.0
+	if style == styleAggressive {
+		oversoldLine, overboughtLine = 40.0, 60.0
+	}
+	last := len(closes) - 1
+	if closes[last] > ema[len(ema)-1] && rsi[len(rsi)-2] <= oversoldLine && rsi[len(rsi)-1] > oversoldLine {
+		return "LONG"
+	}
+	if closes[last] < ema[len(ema)-1] && rsi[len(rsi)-2] >= overboughtLine && rsi[len(rsi)-1] < overboughtLine {
+		return "SHORT"
+	}
+	return "NONE"
+}
+
+func fetchStrategyCandles(symbol, bar string) ([]CandleOHLC, error) {
+	cacheKey := symbol + "|" + bar
+	mtfCandleCache.RLock()
+	entry, ok := mtfCandleCache.entries[cacheKey]
+	mtfCandleCache.RUnlock()
+	if ok && time.Since(entry.fetchedAt) < mtfCacheTTL {
+		return append([]CandleOHLC(nil), entry.candles...), nil
+	}
+
+	endpoint := fmt.Sprintf("https://www.okx.com/api/v5/market/candles?instId=%s&bar=%s&limit=100",
+		url.QueryEscape(symbol), url.QueryEscape(bar))
+	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetch %s candles: %w", bar, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("fetch %s candles: OKX returned HTTP %d", bar, resp.StatusCode)
+	}
+
+	var response struct {
+		Code string     `json:"code"`
+		Msg  string     `json:"msg"`
+		Data [][]string `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+		return nil, fmt.Errorf("decode %s candles: %w", bar, err)
+	}
+	if response.Code != "0" {
+		return nil, fmt.Errorf("fetch %s candles: OKX code %s: %s", bar, response.Code, response.Msg)
+	}
+
+	candles := make([]CandleOHLC, 0, len(response.Data))
+	for i := len(response.Data) - 1; i >= 0; i-- {
+		row := response.Data[i]
+		if len(row) < 6 || (len(row) > 8 && row[8] != "1") {
+			continue
+		}
+		ts, tsErr := strconv.ParseInt(row[0], 10, 64)
+		openPrice, openErr := strconv.ParseFloat(row[1], 64)
+		high, highErr := strconv.ParseFloat(row[2], 64)
+		low, lowErr := strconv.ParseFloat(row[3], 64)
+		closePrice, closeErr := strconv.ParseFloat(row[4], 64)
+		volume, volumeErr := strconv.ParseFloat(row[5], 64)
+		if tsErr != nil || openErr != nil || highErr != nil || lowErr != nil ||
+			closeErr != nil || volumeErr != nil || openPrice <= 0 || closePrice <= 0 ||
+			low <= 0 || high < low || volume < 0 {
+			continue
+		}
+		candles = append(candles, CandleOHLC{
+			Ts: ts, Open: openPrice, High: high, Low: low, Close: closePrice, Volume: volume,
+		})
+	}
+	if len(candles) == 0 {
+		return nil, fmt.Errorf("fetch %s candles: OKX returned no valid closed candles", bar)
+	}
+
+	mtfCandleCache.Lock()
+	mtfCandleCache.entries[cacheKey] = mtfCandleCacheEntry{
+		candles: append([]CandleOHLC(nil), candles...), fetchedAt: time.Now(),
+	}
+	mtfCandleCache.Unlock()
+	return candles, nil
+}
+
+func fetchMultiTimeframeCandles(symbol string) (candles1h, candles15m, candles5m []CandleOHLC, err error) {
+	type result struct {
+		bar     string
+		candles []CandleOHLC
+		err     error
+	}
+	results := make(chan result, 3)
+	for _, bar := range []string{"1H", "15m", "5m"} {
+		go func(bar string) {
+			candles, err := fetchStrategyCandles(symbol, bar)
+			results <- result{bar: bar, candles: candles, err: err}
+		}(bar)
+	}
+	for range 3 {
+		res := <-results
+		if res.err != nil {
+			return nil, nil, nil, res.err
+		}
+		switch res.bar {
+		case "1H":
+			candles1h = res.candles
+		case "15m":
+			candles15m = res.candles
+		case "5m":
+			candles5m = res.candles
+		}
+	}
+	return candles1h, candles15m, candles5m, nil
+}
+
+func checkMtfConfluence(symbol, style string) string {
+	candles1h, candles15m, candles5m, err := fetchMultiTimeframeCandles(symbol)
+	if err != nil {
+		addLog(fmt.Sprintf("[%s][MTF] fetch error: %v", symbol, err))
+		return "NONE"
+	}
+	if len(candles1h) < 50 || len(candles15m) < 30 || len(candles5m) < 30 {
+		addLog(fmt.Sprintf("[%s][MTF] data candle belum cukup untuk indikator", symbol))
+		return "NONE"
+	}
+
+	closes1h := make([]float64, len(candles1h))
+	for i, candle := range candles1h {
+		closes1h[i] = candle.Close
+	}
+	ema1h := indicator.Ema(50, closes1h)
+	if len(ema1h) == 0 {
+		return "NONE"
+	}
+	uptrend := closes1h[len(closes1h)-1] > ema1h[len(ema1h)-1]
+	downtrend := closes1h[len(closes1h)-1] < ema1h[len(ema1h)-1]
+
+	closes15m := make([]float64, len(candles15m))
+	for i, candle := range candles15m {
+		closes15m[i] = candle.Close
+	}
+	_, rsi15m := indicator.Rsi(closes15m)
+	if len(rsi15m) == 0 {
+		return "NONE"
+	}
+
+	closes5m := make([]float64, len(candles5m))
+	for i, candle := range candles5m {
+		closes5m[i] = candle.Close
+	}
+	macd, signal := indicator.Macd(closes5m)
+	if len(macd) < 2 || len(signal) < 2 {
+		return "NONE"
+	}
+	last := len(macd) - 1
+	bullishCross := macd[last-1] <= signal[last-1] && macd[last] > signal[last]
+	bearishCross := macd[last-1] >= signal[last-1] && macd[last] < signal[last]
+
+	rsiLongMax, rsiShortMin := 60.0, 40.0
+	if style == styleAggressive {
+		rsiLongMax, rsiShortMin = 70.0, 30.0
+	}
+	currentRSI := rsi15m[len(rsi15m)-1]
+	if uptrend && currentRSI < rsiLongMax && bullishCross {
+		return "LONG"
+	}
+	if downtrend && currentRSI > rsiShortMin && bearishCross {
+		return "SHORT"
+	}
+	return "NONE"
+}
+
+func checkAdvancedSmc(candles []CandleOHLC, style string) string {
+	if len(candles) < 30 {
+		return "NONE"
+	}
+	last := len(candles) - 1
+	volumes := make([]float64, last)
+	for i := range last {
+		volumes[i] = candles[i].Volume
+	}
+	volSma := indicator.Sma(20, volumes)
+	if len(volSma) == 0 || volSma[len(volSma)-1] <= 0 {
+		return "NONE"
+	}
+	volumeMultiplier := 1.5
+	if style == styleConservative {
+		volumeMultiplier = 2.0
+	}
+	if candles[last].Volume <= volSma[len(volSma)-1]*volumeMultiplier {
+		return "NONE"
+	}
+
+	recentLow, recentHigh := candles[last].Low, candles[last].High
+	start := last - 9
+	if start < 0 {
+		start = 0
+	}
+	for i := start; i <= last; i++ {
+		if candles[i].Low < recentLow {
+			recentLow = candles[i].Low
+		}
+		if candles[i].High > recentHigh {
+			recentHigh = candles[i].High
+		}
+	}
+	tolerance := 0.15
+	if style == styleAggressive {
+		tolerance = 0.30
+	}
+	distanceToLow := (candles[last].Close - recentLow) / recentLow * 100
+	distanceToHigh := (recentHigh - candles[last].Close) / recentHigh * 100
+	if distanceToLow >= 0 && distanceToLow <= tolerance && candles[last].Close > candles[last].Open {
+		return "LONG"
+	}
+	if distanceToHigh >= 0 && distanceToHigh <= tolerance && candles[last].Close < candles[last].Open {
+		return "SHORT"
+	}
+	return "NONE"
 }
 
 // ==========================================
@@ -3314,6 +3727,24 @@ func handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// --- Validasi F5: Entry strategy ------------------------------------
+	if newConfig.StrategyMode == "" {
+		newConfig.StrategyMode = stratMtfConfluence
+	}
+	switch newConfig.StrategyMode {
+	case stratLegacy, stratEmaRsi, stratMtfConfluence, stratAdvancedSmc:
+	default:
+		http.Error(w, "unknown strategyMode", http.StatusBadRequest)
+		return
+	}
+	if newConfig.TradingStyle == "" {
+		newConfig.TradingStyle = styleConservative
+	}
+	if newConfig.TradingStyle != styleConservative && newConfig.TradingStyle != styleAggressive {
+		http.Error(w, "tradingStyle must be \"conservative\" or \"aggressive\"", http.StatusBadRequest)
+		return
+	}
+
 	// --- Kunci restart bila batas loss harian tercapai (F2) -------------
 	if newConfig.IsRunning {
 		state.mu.Lock()
@@ -3421,6 +3852,10 @@ func handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	state.Config.TrailingTriggerPct = newConfig.TrailingTriggerPct
 	state.Config.TrailingDistPct = newConfig.TrailingDistPct
 
+	// --- F5: Entry strategy ---
+	state.Config.StrategyMode = newConfig.StrategyMode
+	state.Config.TradingStyle = newConfig.TradingStyle
+
 	// Tentukan simbol yang tidak lagi dipilih, TETAPI posisi yang masih terbuka
 	// di OKX tetap dipertahankan agar PnL & TP/SL tidak hilang dari dashboard.
 	stillTracked := make(map[string]bool, len(newCoins))
@@ -3484,6 +3919,7 @@ func handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	if newConfig.TrailingEnabled {
 		feat = append(feat, fmt.Sprintf("Trailing=%.2f%%/%.2f%%", newConfig.TrailingTriggerPct, newConfig.TrailingDistPct))
 	}
+	feat = append(feat, fmt.Sprintf("Strategi=%s | Gaya=%s", newConfig.StrategyMode, newConfig.TradingStyle))
 	if len(feat) > 0 {
 		addLog("CONFIG Risiko: " + strings.Join(feat, " | "))
 	}
@@ -4231,6 +4667,30 @@ const uiTemplate = `
                             <p class="text-[11px] t-subtle mt-1.5 leading-relaxed">Dipakai bila <b>Position Sizing (F1)</b> di bawah dalam keadaan OFF. Saat F1 aktif, margin mengikuti F1.</p>
                         </div>
 
+                        <!-- ======== F5: STRATEGY ======== -->
+                        <div class="tile space-y-3">
+                            <div>
+                                <label class="eyebrow block mb-2">Strategi Entry</label>
+                                <select x-model="strategyMode" class="select">
+                                    <option value="bb_rsi_ema200" class="opt">BB + RSI + EMA200 (strategi saat ini)</option>
+                                    <option value="ema_rsi" class="opt">EMA + RSI</option>
+                                    <option value="mtf_confluence" class="opt">MTF Confluence (1H / 15m / 5m)</option>
+                                    <option value="advanced_smc" class="opt">Advanced SMC + Volume</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label class="eyebrow block mb-2">Gaya Trading</label>
+                                <select x-model="tradingStyle" class="select">
+                                    <option value="conservative" class="opt">Conservative — filter tren/volume lebih ketat</option>
+                                    <option value="aggressive" class="opt">Aggressive — sinyal lebih longgar</option>
+                                </select>
+                            </div>
+                            <p class="text-[11px] t-subtle leading-relaxed">
+                                MTF mengambil candle 1H, 15m, dan 5m dari OKX. Strategi baru hanya mengevaluasi candle yang sudah ditutup.
+                                Advanced SMC memerlukan data volume dari feed candle.
+                            </p>
+                        </div>
+
                         <div class="rule"></div>
 
                         <!-- ======== F1: POSITION SIZING ======== -->
@@ -4649,6 +5109,8 @@ const uiTemplate = `
                 timeFilterMode: '24/7', customStartHour: 8, customEndHour: 16,
                 // F4: Trailing Stop (trigger profit -> BEP, SL mengikuti harga ekstrem)
                 trailingEnabled: false, trailingTriggerPct: 0.5, trailingDistPct: 0.3,
+                // F5: Pilihan strategi dan toleransi sinyal.
+                strategyMode: 'mtf_confluence', tradingStyle: 'conservative',
                 // Data akun dari OKX (dipakai F1/F2 & tampilan)
                 balance: 0, dailyPnL: 0, lossLimitHit: false, lossDay: '',
                 // Rasio risiko:hadiah. < 1 berarti konfigurasi terbalik.
@@ -4771,6 +5233,8 @@ const uiTemplate = `
                                 this.trailingEnabled = !!data.Config.trailingEnabled;
                                 this.trailingTriggerPct = data.Config.trailingTriggerPct;
                                 this.trailingDistPct = data.Config.trailingDistPct;
+                                this.strategyMode = data.Config.strategyMode || 'mtf_confluence';
+                                this.tradingStyle = data.Config.tradingStyle || 'conservative';
                             }
                             this.mode = data.Config.mode;
                             this.isRunning = data.Config.isRunning;
@@ -4887,7 +5351,9 @@ const uiTemplate = `
                                 customEndHour: parseInt(this.customEndHour) || 0,
                                 trailingEnabled: !!this.trailingEnabled,
                                 trailingTriggerPct: parseFloat(this.trailingTriggerPct) || 0,
-                                trailingDistPct: parseFloat(this.trailingDistPct) || 0
+                                trailingDistPct: parseFloat(this.trailingDistPct) || 0,
+                                strategyMode: this.strategyMode,
+                                tradingStyle: this.tradingStyle
                             })
                         });
                         const data = await res.json().catch(() => ({}));

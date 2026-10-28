@@ -1,6 +1,6 @@
 # OKX Scalper Bot
 
-Bot dengan dashboard web responsif untuk memantau candle swap USDT OKX dan menjalankan strategi **Long/Short berbasis Bollinger Bands (20,2) + RSI (14) + EMA 200**. Defaultnya **demo trading**. Mode live tersedia, tetapi mengirim order sungguhan dan berisiko kehilangan dana.
+Bot dengan dashboard web responsif untuk memantau candle swap USDT OKX dan menjalankan strategi **Long/Short** yang dapat dipilih. Default strategi adalah MTF Confluence (1H/15m/5m); strategi legacy Bollinger Bands (20,2) + RSI (14) + EMA 200 juga tersedia. Default mode akun adalah **demo trading**. Mode live tersedia, tetapi mengirim order sungguhan dan berisiko kehilangan dana.
 
 > **Peringatan:** Jangan beralih ke live sebelum menguji demo dan memverifikasi ukuran kontrak, parameter order, leverage, serta status posisi di akun OKX. Ini bukan sistem trading siap produksi.
 
@@ -10,7 +10,7 @@ Bot dengan dashboard web responsif untuk memantau candle swap USDT OKX dan menja
 - [Perhitungan Margin & Ukuran Order](#perhitungan-margin--ukuran-order)
 - [TP/SL Entire Position](#tpsl-entire-position)
 - [Fitur Manajemen Risiko (F1–F4)](#fitur-manajemen-risiko-f1f4)
-- [Strategi](#strategi)
+- [Strategi Entry (Long/Short)](#strategi-entry-longshort)
 - [Persyaratan](#persyaratan)
 - [Konfigurasi API](#konfigurasi-api)
 - [Mode Demo](#mode-demo)
@@ -38,6 +38,7 @@ Bot dengan dashboard web responsif untuk memantau candle swap USDT OKX dan menja
 | **F2 Daily Loss Limit** | Batas kerugian harian (realized + unrealized, sejak 00:00 UTC) memicu **shutdown otomatis + tutup semua posisi**. Reset tiap 00:00 UTC. |
 | **F3 Time Filter** | Entry baru hanya di dalam jendela sesi pasar (UTC): Asian, London, New York, NY–London Overlap, atau custom. Posisi terbuka tetap dikelola di luar sesi. |
 | **F4 Trailing Stop** | Native OKX (`move_order_stop`): satu order dengan `callbackRatio` (jarak) + `activePx` (harga aktivasi), digerakkan penuh oleh exchange — SL hanya bergerak menguntungkan, tidak pernah mundur. |
+| **F5 Pilihan strategi** | Pilih strategi BB/RSI/EMA200 yang sudah ada, EMA+RSI, MTF Confluence (1H/15m/5m), atau Advanced SMC+Volume; tersedia gaya conservative/aggressive. |
 | **Sinkronisasi OKX** | Posisi, ukuran kontrak, dan PnL diambil dari OKX tiap 10 detik. |
 | **PnL riil** | Dihitung dari riwayat fill OKX (`/api/v5/trade/fills`) termasuk fee. |
 | **Peringkat konfigurasi** | Instrumen yang delisted dari OKX ditolak backend dengan HTTP 400. |
@@ -65,9 +66,6 @@ marginReal = size × harga × ctVal / leverage
 ### Kenapa margin dulu tidak sesuai
 
 Versi lama memakai peta `contractMultipliers` yang **salah total** untuk sebagian besar koin:
-
-| Koin | Hardcode (lama) | `ctVal` OKX (benar) | Error |
-| --- | --- | --- | --- |
 | SOL-USDT-SWAP | 0.1 | **1** | 10× |
 | DOGE-USDT-SWAP | 10 | **1000** | 100× |
 | XRP-USDT-SWAP | 1 | **100** | 100× |
@@ -119,16 +117,6 @@ Mode **persen**: default `Take Profit = 0.8%` dan `Stop Loss = 0.4%` — **risik
 Invarian yang dijamin (diuji terhadap spesifikasi & harga asli OKX):
 
 ```
-hadiah yang terjadi   >= Take Profit%   (dibulatkan menjauh dari entry)
-risiko yang terjadi   <= Stop Loss%     (dibulatkan mendekati entry)
-R:R yang terjadi      >= 1 : 2          (tidak pernah lebih buruk dari config)
-```
-
-Contoh dengan tick size asli (ADA, entry 0.244786, tick 0.0001): TP dibulatkan ke atas → `+0.823%` (≥ 0.8%), SL dibulatkan ke atas juga → `−0.362%` (≤ 0.4%). Risiko tidak pernah melebihi yang dikonfigurasi.
-
-### Kenapa harus dua elemen terpisah
-
-Jika `tpTriggerPx` dan `slTriggerPx` diletakkan pada **satu** elemen `attachAlgoOrds`, OKX akan **membagi ukuran posisi** (setengah untuk TP, setengah untuk SL). Dua elemen terpisah memastikan masing-masing menutup 100%.
 
 ```json
 "attachAlgoOrds": [
@@ -226,11 +214,11 @@ Empat fitur tambahan untuk position sizing, proteksi harian, filter sesi, dan tr
 - Harga trigger trailing yang dihitung OKX tampil di kartu koin (badge `TRAIL`,
   `MENUNGGU AKTIVASI` sebelum `activePx` tersentuh).
 
-## Strategi (Long/Short — BB + RSI + EMA 200)
+## Strategi Entry (Long/Short)
 
-Strategi reversal berbasis tiga indikator, dievaluasi **sekalipun per candle yang baru ditutup**, dan entry dipasang di **pembukaan candle berikutnya** memakai **Limit Order** (fee lebih rendah).
+Strategi legacy berbasis tiga indikator ini dievaluasi **sekali per candle yang baru ditutup**, dan entry dipasang di **pembukaan candle berikutnya** memakai **Limit Order** (fee lebih rendah). Strategi dan gaya dapat dipilih dari panel Trade Configuration.
 
-- Timeframe: `5m` (default) atau `15m` — ubah lewat dashboard (`timeframe`).
+- Timeframe strategi legacy: `5m` (default).
 - Indikator: **Bollinger Bands (20, 2)**, **RSI (14)** ambang 30/70, **EMA 200** sebagai filter tren utama.
 - Buffer candle 250+ titik di-seed dari REST OKX saat startup agar semua indikator matang.
 
@@ -261,6 +249,18 @@ Strategi reversal berbasis tiga indikator, dievaluasi **sekalipun per candle yan
 - Margin isolated, leverage mengikuti input dashboard (`set-leverage` dipanggil sebelum tiap order).
 
 Koin yang margin-nya tidak cukup untuk 1 lot tidak akan di-order; dashboard menampilkan nilai margin minimum yang dibutuhkan.
+
+### Strategi tambahan (F5)
+
+Default sistem adalah **MTF Confluence** dengan gaya **conservative**. Strategi legacy BB/RSI/EMA200 tetap tersedia untuk menjaga opsi perilaku entry sebelumnya.
+
+| Strategi | Sinyal |
+| --- | --- |
+| **EMA + RSI** | EMA50 menjadi filter arah; entry saat RSI menyeberang kembali dari area oversold/overbought. |
+| **MTF Confluence** | Arah tren EMA50 pada 1H, RSI pada 15m, dan persilangan MACD pada 5m harus searah. Candle ditarik dari endpoint market publik OKX dan hasilnya di-cache singkat. |
+| **Advanced SMC + Volume** | Reaksi candle bullish/bearish dekat ekstrem 10 candle terakhir harus disertai lonjakan volume terhadap SMA20. |
+
+Gaya **conservative** menambahkan filter ADX minimal 25 pada EMA+RSI dan MTF serta menggunakan ambang volume yang lebih tinggi pada Advanced SMC. Gaya **aggressive** melonggarkan ambang RSI atau jarak ekstrem. Sinyal semua strategi hanya menggunakan candle yang telah ditutup; entry tetap memakai LIMIT pada open candle berikutnya. Strategi baru sebaiknya diuji di mode demo sebelum digunakan live.
 
 ## Persyaratan
 
