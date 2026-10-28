@@ -65,9 +65,6 @@ marginReal = size × harga × ctVal / leverage
 ### Kenapa margin dulu tidak sesuai
 
 Versi lama memakai peta `contractMultipliers` yang **salah total** untuk sebagian besar koin:
-
-| Koin | Hardcode (lama) | `ctVal` OKX (benar) | Error |
-| --- | --- | --- | --- |
 | SOL-USDT-SWAP | 0.1 | **1** | 10× |
 | DOGE-USDT-SWAP | 10 | **1000** | 100× |
 | XRP-USDT-SWAP | 1 | **100** | 100× |
@@ -119,16 +116,6 @@ Mode **persen**: default `Take Profit = 0.8%` dan `Stop Loss = 0.4%` — **risik
 Invarian yang dijamin (diuji terhadap spesifikasi & harga asli OKX):
 
 ```
-hadiah yang terjadi   >= Take Profit%   (dibulatkan menjauh dari entry)
-risiko yang terjadi   <= Stop Loss%     (dibulatkan mendekati entry)
-R:R yang terjadi      >= 1 : 2          (tidak pernah lebih buruk dari config)
-```
-
-Contoh dengan tick size asli (ADA, entry 0.244786, tick 0.0001): TP dibulatkan ke atas → `+0.823%` (≥ 0.8%), SL dibulatkan ke atas juga → `−0.362%` (≤ 0.4%). Risiko tidak pernah melebihi yang dikonfigurasi.
-
-### Kenapa harus dua elemen terpisah
-
-Jika `tpTriggerPx` dan `slTriggerPx` diletakkan pada **satu** elemen `attachAlgoOrds`, OKX akan **membagi ukuran posisi** (setengah untuk TP, setengah untuk SL). Dua elemen terpisah memastikan masing-masing menutup 100%.
 
 ```json
 "attachAlgoOrds": [
