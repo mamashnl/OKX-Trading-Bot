@@ -12,6 +12,7 @@ Bot dengan dashboard web responsif untuk memantau candle swap USDT OKX dan menja
 - [Fitur Manajemen Risiko (F1–F4)](#fitur-manajemen-risiko-f1f4)
 - [Strategi Entry (Long/Short)](#strategi-entry-longshort)
 - [Persyaratan](#persyaratan)
+- [Instalasi & Deploy](#instalasi--deploy)
 - [Konfigurasi API](#konfigurasi-api)
 - [Mode Demo](#mode-demo)
 - [Beralih ke Live](#beralih-ke-live)
@@ -269,6 +270,21 @@ Gaya **conservative** menambahkan filter ADX minimal 25 pada EMA+RSI dan MTF ser
 - Koneksi internet yang mengizinkan WebSocket ke OKX.
 - Linux/macOS dengan shell kompatibel POSIX.
 
+## Instalasi & Deploy
+
+Panduan deploy lengkap — dari `git clone`, build, systemd service, firewall, nginx reverse proxy, sampai SSL dengan Certbot atau Cloudflare — ada di **[`INSTALLATION.md`](INSTALLATION.md)**.
+
+Ringkasan cepat:
+
+```sh
+git clone https://github.com/mamashnl/OKX-Trading-Bot.git && cd OKX-Trading-Bot
+cp .env.example .env && nano .env && chmod 600 .env
+go build -o okx-bot .
+systemctl enable --now okx-bot     # unit: /etc/systemd/system/okx-bot.service
+```
+
+Dashboard kemudian diakses lewat HTTPS domain (mis. `https://okx.maulmshr.my.id`) yang di-proxy nginx ke `127.0.0.1:8080`.
+
 ## Konfigurasi API
 
 Aplikasi membaca `.env` dari direktori kerja saat startup.
@@ -344,6 +360,8 @@ Nilai konfigurasi tidak akan di-reset oleh polling `/api/state` selama accordion
 Menampilkan Order Size, Margin Used, Notional, Leverage, ukuran posisi, harga entry, TP, SL, dan badge `100% POSISI` bila TP/SL sudah terpasang di OKX.
 
 ## Akses dari HP (ngrok)
+
+> **Sudah tidak diperlukan bila server punya domain publik.** Setup produksi saat ini memakai nginx + SSL sehingga dashboard dibuka langsung dari HP di `https://<domain-anda>`. Lihat [`INSTALLATION.md`](INSTALLATION.md). Cara ngrok di bawah hanya untuk server tanpa domain/port publik.
 
 Karena port `8080` tidak dibuka ke publik, gunakan ngrok (jalankan dari direktori mana pun selama biner `ngrok` ada di `PATH`):
 
